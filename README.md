@@ -8,11 +8,11 @@
 
 - 单臂 A/B 抓放、垂直接近与抬升、运输高度和归位流程。
 - 双臂依赖调度、等待、保持与返程；自然语言示例可编译为 43 个底层节点。
-- 外部执行包校验、单次提交、两阶段预检/提交、查询、事件和取消。
+- 外部执行包校验、每请求新执行的单次提交、面向自动重试的显式幂等提交、两阶段预检/提交、查询、事件和取消。
 - 持久幂等、设备所有权、场景版本及事件 outbox。
 - 控制器位姿/关节收敛、夹爪行程反馈、失败停止和执行日志。
 
-外部合同使用 `RuntimeExecutionPackage 2.1`、`graph_version=0.1`、`dobot-dag/1`。目前支持 `embodied.pick@1.0.0`、`embodied.place@1.0.0`、`wait` 和 success AND 依赖；位置由本机场景标定解析。Mock 可跨臂并行，外部网关 live 模式对共享工作区保守串行。
+外部合同使用 `RuntimeExecutionPackage 2.1`、`graph_version=0.1`、`dobot-dag/1`。目前支持 `embodied.pick@1.0.0`、`embodied.place@1.0.0`、`wait` 和 success AND 依赖；位置由本机场景标定解析。Mock 与 live 网关都允许左右臂独立技能并行，同臂动作须在依赖图中显式串行；跨臂并行不提供碰撞检测。
 
 ## 本地单臂与双臂操作
 

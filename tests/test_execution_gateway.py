@@ -16,20 +16,20 @@ from urllib.request import Request, urlopen
 from task_skills.device_lease import DeviceLease
 from task_skills.dobot_adapter import DobotHardwareAdapter
 from task_skills.atomic_graph import AtomicNode
-from task_skills.gateway.contracts import Catalog, ContractError
+from task_skills.gateway.contracts import Catalog, ContractError, digest
 from task_skills.gateway.server import GatewayServer
 from task_skills.gateway.service import Gateway
 from task_skills.gateway.store import Store
 from task_skills.gateway.upstream import DeliveryWorker, Upstream
 from task_skills.gateway.operator import reset_scene
 from task_skills.models import load_scene_config
-from task_skills.run_graph import MockAdapter
+from task_skills.run_graph import MockAdapter, run_graph
 
 
 SCENE = Path(__file__).resolve().parents[1] / "task_skills/scene_config.json"
 
 
-def package(revision, suffix="1", hold=0):
+def package(revision=None, suffix="1", hold=0):
     def action(node_id, skill, arm, obj, ref):
         return {"node_id": node_id, "node_type": "action", "status": "pending", "timeout_s": 30,
                 "skill_invocation": {"skill_id": "embodied." + skill, "skill_version": "1.0.0",
@@ -46,10 +46,43 @@ def package(revision, suffix="1", hold=0):
              action("return-B", "place", "right", "B", "object:B")]
     edges = [("pick-A", "hold-A"), ("hold-A", "place-A"), ("pick-B", "place-B"),
              ("place-A", "repick-B"), ("place-B", "repick-B"), ("repick-B", "return-B")]
-    return {"schema_version": "2.1", "graph_version": "0.1", "package_id": "runtime-" + suffix,
-            "recipe_id": "pick-place", "version": "1.0", "experiment_id": "experiment-" + suffix,
-            "catalog_revision": revision, "entry_node_ids": ["pick-A", "pick-B"], "nodes": nodes,
-            "edges": [{"source": a, "target": b, "edge_type": "success"} for a, b in edges]}
+    result = {"schema_version": "2.1", "graph_version": "0.1", "package_id": "runtime-" + suffix,
+              "recipe_id": "pick-place", "version": "1.0", "experiment_id": "experiment-" + suffix,
+              "entry_node_ids": ["pick-A", "pick-B"], "nodes": nodes,
+              "edges": [{"source": a, "target": b, "edge_type": "success"} for a, b in edges]}
+    if revision is not None:
+        result["catalog_revision"] = revision
+    return result
+
+
+def wait_package(suffix, revision=None):
+    result = {"schema_version": "2.1", "graph_version": "0.1", "package_id": "wait-" + suffix,
+              "experiment_id": "experiment-" + suffix, "entry_node_ids": ["wait"],
+              "nodes": [{"node_id": "wait", "node_type": "wait", "status": "pending", "duration_s": 0}],
+              "edges": []}
+    if revision is not None:
+        result["catalog_revision"] = revision
+    return result
+
+
+class FakeLiveAdapter(MockAdapter):
+    def snapshot_all(self):
+        from task_skills.layout import physical_nova_home_degrees
+        return {
+            arm: {
+                "mode": 5,
+                "errors": "0,{0},GetErrorID();",
+                "joints": "0,{%s},GetAngle();" % ",".join(
+                    str(value) for value in physical_nova_home_degrees(arm)),
+            }
+            for arm in ("left", "right")
+        }
+
+    def configure_robot(self, arm, speed):
+        pass
+
+    def stop_and_verify(self):
+        return {"confirmed": True, "hardware_connected": False}
 
 
 class CompilerHandler(BaseHTTPRequestHandler):
@@ -107,7 +140,7 @@ class GatewayTests(unittest.TestCase):
             return response.code, json.loads(response.read())
 
     def submit(self, graph=None, key="dispatch-1"):
-        return self.request("/v1/execute-graph", {"graph": graph or package(self.gateway.catalog.revision)}, key)
+        return self.request("/v1/execute-graph/idempotent", {"graph": graph or package(self.gateway.catalog.revision)}, key)
 
     def finish(self, execution_id):
         deadline = time.monotonic() + 15
@@ -117,6 +150,20 @@ class GatewayTests(unittest.TestCase):
                 return result
             time.sleep(0.01)
         self.fail("Execution did not terminate")
+
+    def reset_mock_scene(self):
+        data_dir = Path(self.temp.name) / "data"
+        scene = self.gateway.scene
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.gateway.close()
+        reset_scene(data_dir, scene, "mock", data_dir / "mock-reset-owner")
+        self.gateway = Gateway(scene, data_dir)
+        self.server = GatewayServer(("127.0.0.1", 0), self.gateway, token="test-token")
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02})
+        self.thread.start()
+        self.url = "http://127.0.0.1:" + str(self.server.server_port)
 
     def test_http_pipeline_bypasses_natural_language_and_preserves_join(self):
         with patch("task_skills.parser.parse_instruction", side_effect=AssertionError("NL parser must not run")):
@@ -143,6 +190,115 @@ class GatewayTests(unittest.TestCase):
         altered["nodes"][2]["duration_s"] = 0.1
         code, response = self.submit(altered)
         self.assertEqual((code, response["code"]), (409, "IDEMPOTENCY_CONFLICT"))
+
+    def test_execute_graph_creates_fresh_execution_with_server_generated_node_keys(self):
+        graph = package(self.gateway.catalog.revision, "fresh-static")
+        graph["run_id"] = "run-fresh-static"
+        original = copy.deepcopy(graph)
+        body = {"graph": graph, "request_id": "fixed-body-request"}
+
+        code, first = self.request("/v1/execute-graph", body, "fixed-header-key")
+        self.assertEqual(code, 202)
+        self.assertEqual(self.finish(first["execution_id"])["status"], "succeeded")
+        first_package = self.gateway.store.get(first["execution_id"])["package"]
+        first_keys = [node["skill_invocation"]["idempotency_key"] for node in first_package["nodes"]
+                      if node["node_type"] == "action"]
+
+        code, blocked = self.request("/v1/execute-graph", body, "fixed-header-key")
+        self.assertEqual((code, blocked["code"]), (422, "INVALID_OBJECT_STATE"))
+
+        self.reset_mock_scene()
+        code, second = self.request("/v1/execute-graph", body, "fixed-header-key")
+        self.assertEqual(code, 202)
+        self.assertEqual(self.finish(second["execution_id"])["status"], "succeeded")
+        second_package = self.gateway.store.get(second["execution_id"])["package"]
+        second_keys = [node["skill_invocation"]["idempotency_key"] for node in second_package["nodes"]
+                       if node["node_type"] == "action"]
+
+        self.assertNotEqual(first["execution_id"], second["execution_id"])
+        self.assertEqual(graph, original, "Fresh submission must not mutate the caller-owned package")
+        self.assertEqual(first_package["package_id"], graph["package_id"])
+        self.assertEqual(second_package["package_id"], graph["package_id"])
+        self.assertEqual(second_package["run_id"], graph["run_id"])
+        self.assertEqual([node["node_id"] for node in second_package["nodes"]],
+                         [node["node_id"] for node in graph["nodes"]])
+        self.assertEqual(len(second_keys), len(set(second_keys)))
+        self.assertTrue(set(first_keys).isdisjoint(second_keys))
+        self.assertNotEqual(second_keys, [node["skill_invocation"]["idempotency_key"]
+                                         for node in graph["nodes"] if node["node_type"] == "action"])
+
+    def test_execute_graph_rejects_a_second_request_while_execution_is_active(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class HeldAdapter(MockAdapter):
+            def execute_atomic(self, node, scene):
+                if node.node_id == "pick-A:0":
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("Test did not release held action")
+                return super().execute_atomic(node, scene)
+
+        self.gateway.adapter_factory = lambda cancel: HeldAdapter(cancel)
+        body = {"graph": package(self.gateway.catalog.revision, "held-repeat"),
+                "request_id": "same-request-id"}
+        code, first = self.request("/v1/execute-graph", body, "same-header-key")
+        self.assertEqual(code, 202)
+        try:
+            self.assertTrue(entered.wait(2), "Execution did not reach the held action")
+            code, blocked = self.request("/v1/execute-graph", body, "same-header-key")
+            self.assertEqual((code, blocked["code"]), (409, "RESOURCE_CONFLICT"))
+            self.assertEqual(self.gateway.active, first["execution_id"])
+        finally:
+            release.set()
+        self.assertEqual(self.finish(first["execution_id"])["status"], "succeeded")
+
+    def test_execute_graph_rejects_resume_run_id_and_two_phase_shapes(self):
+        graph = package(self.gateway.catalog.revision)
+        unsupported = [
+            {"run_id": "upstream-only"},
+            {"graph": graph, "run_id": "upstream-only"},
+            {"graph": graph, "validation_token": "validation-token"},
+            {"graph": graph, "execution_id": "execution-old"},
+            {"graph": graph, "resume_from_node_id": "pick-A"},
+            {"graph": graph, "mode": "mock"},
+            {"graph": graph, "unexpected": True},
+            {"graph": graph, "package": graph},
+        ]
+        for body in unsupported:
+            with self.subTest(body=list(body)):
+                code, response = self.request("/v1/execute-graph", body, "fixed-key")
+                self.assertEqual((code, response["code"]), (400, "INVALID_REQUEST"))
+        malformed_graph = copy.deepcopy(graph)
+        malformed_graph["nodes"] = "not-a-node-list"
+        code, response = self.request("/v1/execute-graph", {"graph": malformed_graph}, "fixed-key")
+        self.assertEqual((code, response["code"]), (422, "INVALID_GRAPH"))
+        code, response = self.request("/v1/execute-graph", {"graph": graph}, authorized=False)
+        self.assertEqual((code, response["code"]), (401, "UNAUTHORIZED"))
+
+    def test_new_execution_service_does_not_mutate_the_supplied_package(self):
+        graph = package(self.gateway.catalog.revision, "direct-repeat")
+        original = copy.deepcopy(graph)
+        result = self.gateway.submit_new_execution({"graph": graph})
+        self.assertEqual(graph, original)
+        self.assertEqual(self.finish(result["execution_id"])["status"], "succeeded")
+
+    def test_execute_graph_does_not_require_an_idempotency_header(self):
+        graph = package(self.gateway.catalog.revision, "no-idempotency-key")
+        code, result = self.request("/v1/execute-graph", {"graph": graph})
+        self.assertEqual(code, 202)
+        self.assertEqual(self.finish(result["execution_id"])["status"], "succeeded")
+
+    def test_execute_graph_obeys_reservation_gate(self):
+        graph = package(self.gateway.catalog.revision, "gated-submission")
+        self.gateway.preflight({"package": graph}, "submission-reservation")
+        code, response = self.request("/v1/execute-graph", {"graph": graph}, "submission-key")
+        self.assertEqual((code, response["code"]), (409, "RESOURCE_CONFLICT"))
+
+    def test_execute_graph_obeys_quarantine_gate(self):
+        graph = package(self.gateway.catalog.revision, "quarantined-submission")
+        self.gateway.store.quarantine("test quarantine")
+        code, response = self.request("/v1/execute-graph", {"graph": graph}, "submission-key")
+        self.assertEqual((code, response["code"]), (409, "STOP_UNCONFIRMED"))
 
     def test_concurrent_duplicate_requests_start_one_worker(self):
         graph = package(self.gateway.catalog.revision, hold=0.1)
@@ -223,7 +379,6 @@ class GatewayTests(unittest.TestCase):
     def test_unsupported_semantics_are_rejected_before_any_adapter(self):
         self.gateway.adapter_factory = lambda _: self.fail("Adapter constructed for invalid graph")
         mutations = [
-            ("STALE_CATALOG_REVISION", lambda g: g.update(catalog_revision="old")),
             ("UNSUPPORTED_NODE_TYPE", lambda g: g["nodes"][0].update(node_type="observe")),
             ("UNSUPPORTED_EDGE_TYPE", lambda g: g["edges"][0].update(edge_type="failure")),
             ("UNSUPPORTED_SKILL", lambda g: g["nodes"][0]["skill_invocation"].update(skill_id="embodied.load")),
@@ -306,12 +461,418 @@ class GatewayTests(unittest.TestCase):
         result = self.submit()[1]
         self.assertEqual(self.finish(result["execution_id"])["status"], "succeeded")
 
+    def test_live_independent_arm_skills_enter_concurrently_and_failure_cancels_sibling(self):
+        live_catalog = Catalog(self.gateway.scene, "live")
+        plan = live_catalog.validate(package(live_catalog.revision))
+        cancel = threading.Event()
+        entry_barrier = threading.Barrier(2)
+        entry_lock = threading.Lock()
+        entered_arms, calls = set(), []
+
+        class FakeLiveAdapter(MockAdapter):
+            def snapshot_all(self):
+                from task_skills.layout import physical_nova_home_degrees
+                return {
+                    arm: {
+                        "mode": 5,
+                        "errors": "0,{0},GetErrorID();",
+                        "joints": "0,{%s},GetAngle();" % ",".join(
+                            str(value) for value in physical_nova_home_degrees(arm)),
+                    }
+                    for arm in ("left", "right")
+                }
+
+            def configure_robot(self, arm, speed):
+                pass
+
+            def execute_atomic(self, node, scene):
+                with entry_lock:
+                    calls.append(node.node_id)
+                if node.node_id in {"pick-A:0", "pick-B:0"}:
+                    with entry_lock:
+                        entered_arms.add(node.arm)
+                    entry_barrier.wait(timeout=2)
+                    if node.arm == "left":
+                        raise RuntimeError("Injected fake-live controller failure")
+                    if self.cancel.wait(2):
+                        raise InterruptedError("Execution cancelled")
+                    raise AssertionError("Sibling was not cancelled after the other arm failed")
+                if self.cancel.is_set():
+                    raise InterruptedError("Execution cancelled")
+                return {"fake_live": True}
+
+            def stop_and_verify(self):
+                return {"confirmed": True, "hardware_connected": False}
+
+        adapter = FakeLiveAdapter(cancel)
+        events = []
+        try:
+            with TemporaryDirectory() as temp:
+                result = run_graph(plan, adapter, self.gateway.scene, temp, cancel,
+                                   lambda event_type, **kwargs: events.append((event_type, kwargs)), live=True)
+        finally:
+            adapter.close()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"]["node_id"], "pick-A")
+        self.assertTrue(result["stop"]["confirmed"])
+        self.assertEqual(entered_arms, {"left", "right"})
+        self.assertEqual(set(calls), {"pick-A:0", "pick-B:0"})
+        node_results = {
+            kwargs.get("node_id"): event_type
+            for event_type, kwargs in events if kwargs.get("node_id")
+        }
+        self.assertEqual(node_results["pick-A"], "action_failed")
+        self.assertEqual(node_results["pick-B"], "action_cancelled")
+
+    def test_live_success_preserves_wait_and_join_readiness(self):
+        live_catalog = Catalog(self.gateway.scene, "live")
+        plan = live_catalog.validate(package(live_catalog.revision, hold=0.02))
+        cancel = threading.Event()
+        pick_barrier = threading.Barrier(2)
+        entry_lock = threading.Lock()
+        entered_arms, calls = set(), []
+
+        class FakeLiveAdapter(MockAdapter):
+            def snapshot_all(self):
+                from task_skills.layout import physical_nova_home_degrees
+                return {
+                    arm: {
+                        "mode": 5,
+                        "errors": "0,{0},GetErrorID();",
+                        "joints": "0,{%s},GetAngle();" % ",".join(
+                            str(value) for value in physical_nova_home_degrees(arm)),
+                    }
+                    for arm in ("left", "right")
+                }
+
+            def configure_robot(self, arm, speed):
+                pass
+
+            def execute_atomic(self, node, scene):
+                with entry_lock:
+                    calls.append(node.node_id)
+                if node.node_id in {"pick-A:0", "pick-B:0"}:
+                    with entry_lock:
+                        entered_arms.add(node.arm)
+                    pick_barrier.wait(timeout=2)
+                if self.cancel.is_set():
+                    raise InterruptedError("Execution cancelled")
+                return {"fake_live": True, "node_id": node.node_id}
+
+            def stop_and_verify(self):
+                return {"confirmed": True, "hardware_connected": False}
+
+        adapter = FakeLiveAdapter(cancel)
+        events = []
+        try:
+            with TemporaryDirectory() as temp:
+                result = run_graph(plan, adapter, self.gateway.scene, temp, cancel,
+                                   lambda event_type, **kwargs: events.append((event_type, kwargs)), live=True)
+        finally:
+            adapter.close()
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(entered_arms, {"left", "right"})
+        self.assertIn("final:left", calls)
+        self.assertIn("final:right", calls)
+        wait_completed = next(
+            index for index, (event_type, kwargs) in enumerate(events)
+            if event_type == "wait_completed" and kwargs.get("node_id") == "hold-A"
+        )
+        started = {
+            kwargs["node_id"]: index
+            for index, (event_type, kwargs) in enumerate(events)
+            if event_type == "action_started"
+        }
+        completed = {
+            kwargs["node_id"]: index
+            for index, (event_type, kwargs) in enumerate(events)
+            if event_type == "action_completed"
+        }
+        self.assertGreater(started["place-A"], wait_completed)
+        self.assertGreater(started["repick-B"], max(completed["place-A"], completed["place-B"]))
+        self.assertGreater(started["return-B"], completed["repick-B"])
+        self.assertIn("action_completed", [event_type for event_type, kwargs in events
+                                           if kwargs.get("node_id") == "return-B"])
+
+    def test_live_final_homes_run_together_and_success_waits_for_both(self):
+        live_catalog = Catalog(self.gateway.scene, "live")
+        plan = live_catalog.validate(package(live_catalog.revision))
+        cancel = threading.Event()
+        homes_entered = threading.Event()
+        release_homes = threading.Event()
+        home_barrier = threading.Barrier(2)
+        home_lock = threading.Lock()
+        entered_arms, completed_arms = set(), set()
+
+        class ParallelHome(FakeLiveAdapter):
+            def execute_atomic(self, node, scene):
+                if node.operation == "move_safe_pose":
+                    with home_lock:
+                        entered_arms.add(node.arm)
+                        if len(entered_arms) == 2:
+                            homes_entered.set()
+                    home_barrier.wait(timeout=2)
+                    if not release_homes.wait(4):
+                        raise TimeoutError("Test did not release final homes")
+                    with home_lock:
+                        completed_arms.add(node.arm)
+                    return {"homed": node.arm}
+                return super().execute_atomic(node, scene)
+
+        adapter = ParallelHome(cancel)
+        events = []
+        with ThreadPoolExecutor(max_workers=1) as runner:
+            with TemporaryDirectory() as temp:
+                result_future = runner.submit(
+                    run_graph, plan, adapter, self.gateway.scene, temp,
+                    cancel, lambda event_type, **kwargs: events.append((event_type, kwargs)), True)
+                try:
+                    self.assertTrue(homes_entered.wait(2), "Both arms did not enter final homing")
+                    self.assertFalse(result_future.done(), "Execution returned before either home was released")
+                finally:
+                    release_homes.set()
+                result = result_future.result(timeout=5)
+        adapter.close()
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(entered_arms, {"left", "right"})
+        self.assertEqual(completed_arms, {"left", "right"})
+        finalizing = {kwargs["payload"]["arm"] for event_type, kwargs in events
+                      if event_type == "arm_finalizing"}
+        finalized = {kwargs["payload"]["arm"] for event_type, kwargs in events
+                     if event_type == "arm_finalized"}
+        self.assertEqual(finalizing, {"left", "right"})
+        self.assertEqual(finalized, {"left", "right"})
+
+    def test_live_final_home_failure_stops_sibling_and_rechecks_stop(self):
+        live_catalog = Catalog(self.gateway.scene, "live")
+        plan = live_catalog.validate(package(live_catalog.revision))
+
+        for confirmed in (True, False):
+            with self.subTest(stop_confirmed=confirmed):
+                cancel = threading.Event()
+                home_barrier = threading.Barrier(2)
+                sibling_active, stop_called, sibling_done = (
+                    threading.Event(), threading.Event(), threading.Event())
+                stop_states, stop_calls = [], []
+
+                class FailingHome(FakeLiveAdapter):
+                    def execute_atomic(self, node, scene):
+                        if node.operation == "move_safe_pose":
+                            home_barrier.wait(timeout=2)
+                            if node.arm == "left":
+                                raise RuntimeError("Injected left home failure")
+                            sibling_active.set()
+                            if not stop_called.wait(2):
+                                raise TimeoutError("Stop was not requested for home sibling")
+                            sibling_active.clear()
+                            sibling_done.set()
+                            raise InterruptedError("Sibling stopped during final homing")
+                        return super().execute_atomic(node, scene)
+
+                    def stop_and_verify(self):
+                        if not stop_calls:
+                            sibling_active.wait(2)
+                        stop_states.append(sibling_active.is_set())
+                        stop_calls.append(True)
+                        stop_called.set()
+                        return {"confirmed": confirmed, "hardware_connected": False}
+
+                adapter = FailingHome(cancel)
+                events = []
+                with TemporaryDirectory() as temp:
+                    result = run_graph(plan, adapter, self.gateway.scene, temp, cancel,
+                                       lambda event_type, **kwargs: events.append((event_type, kwargs)), live=True)
+                adapter.close()
+
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["error"]["arm"], "left")
+                self.assertEqual(result["error"]["phase"], "final_home")
+                self.assertEqual(result["stop"]["confirmed"], confirmed)
+                self.assertTrue(sibling_done.is_set())
+                self.assertEqual(len(stop_calls), 2)
+                self.assertTrue(stop_states[0], "Initial stop check must run while sibling home is active")
+                self.assertFalse(stop_states[-1], "Final stop check must run after home workers drain")
+                self.assertTrue(any(event_type == "arm_finalization_failed"
+                                    and kwargs["payload"]["arm"] == "left"
+                                    for event_type, kwargs in events))
+
+    def test_live_finalization_event_failure_stops_and_drains_started_home(self):
+        live_catalog = Catalog(self.gateway.scene, "live")
+        plan = live_catalog.validate(package(live_catalog.revision))
+        cancel = threading.Event()
+        home_started, stop_called, home_done = threading.Event(), threading.Event(), threading.Event()
+        active_lock = threading.Lock()
+        active_arms, stop_states, started_events = set(), [], []
+
+        class ActiveHome(FakeLiveAdapter):
+            def execute_atomic(self, node, scene):
+                if node.operation == "move_safe_pose":
+                    with active_lock:
+                        active_arms.add(node.arm)
+                    home_started.set()
+                    if not stop_called.wait(2):
+                        raise TimeoutError("Finalization failure did not trigger stop")
+                    with active_lock:
+                        active_arms.discard(node.arm)
+                    home_done.set()
+                    raise InterruptedError("Home cancelled after event failure")
+                return super().execute_atomic(node, scene)
+
+            def stop_and_verify(self):
+                with active_lock:
+                    stop_states.append(set(active_arms))
+                stop_called.set()
+                return {"confirmed": True, "hardware_connected": False}
+
+        def emit(event_type, **kwargs):
+            if event_type == "arm_finalizing":
+                arm = kwargs["payload"]["arm"]
+                started_events.append(arm)
+                if arm == "right":
+                    self.assertTrue(home_started.wait(1), "First arm home did not start before the second event")
+                    raise OSError("Injected event store failure")
+
+        adapter = ActiveHome(cancel)
+        with TemporaryDirectory() as temp:
+            result = run_graph(plan, adapter, self.gateway.scene, temp, cancel, emit, live=True)
+        adapter.close()
+
+        self.assertEqual(started_events, ["left", "right"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"]["code"], "FINALIZATION_EVENT_FAILED")
+        self.assertEqual(result["error"]["phase"], "final_home")
+        self.assertEqual(result["error"]["arm"], "right")
+        self.assertTrue(result["stop"]["confirmed"])
+        self.assertTrue(home_done.is_set())
+        self.assertEqual(len(stop_states), 2)
+        self.assertEqual(stop_states[0], {"left"}, "Prompt stop must happen while the submitted home is active")
+        self.assertEqual(stop_states[-1], set(), "Final stop verification must follow worker drain")
+
+    def test_live_cancel_during_final_homing_cannot_return_success(self):
+        live_catalog = Catalog(self.gateway.scene, "live")
+        plan = live_catalog.validate(package(live_catalog.revision))
+        cancel = threading.Event()
+        homes_entered = threading.Event()
+        home_barrier = threading.Barrier(2)
+        home_lock = threading.Lock()
+        entered_arms, stop_states = set(), []
+
+        class CancellableHome(FakeLiveAdapter):
+            def execute_atomic(self, node, scene):
+                if node.operation == "move_safe_pose":
+                    home_barrier.wait(timeout=2)
+                    with home_lock:
+                        entered_arms.add(node.arm)
+                        if len(entered_arms) == 2:
+                            homes_entered.set()
+                    if self.cancel.wait(2):
+                        raise InterruptedError("Cancelled during final homing")
+                    raise TimeoutError("Test did not cancel final homing")
+                return super().execute_atomic(node, scene)
+
+            def stop_and_verify(self):
+                stop_states.append(set(entered_arms))
+                return {"confirmed": True, "hardware_connected": False}
+
+        adapter = CancellableHome(cancel)
+        events = []
+        with ThreadPoolExecutor(max_workers=1) as runner:
+            with TemporaryDirectory() as temp:
+                result_future = runner.submit(
+                    run_graph, plan, adapter, self.gateway.scene, temp, cancel,
+                    lambda event_type, **kwargs: events.append((event_type, kwargs)), True)
+                self.assertTrue(homes_entered.wait(2), "Both arms did not enter final homing")
+                self.assertFalse(result_future.done())
+                cancel.set()
+                result = result_future.result(timeout=4)
+        adapter.close()
+
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["error"]["phase"], "final_home")
+        self.assertIn(result["error"]["arm"], {"left", "right"})
+        self.assertEqual(result["stop"]["confirmed"], True)
+        self.assertEqual(len(stop_states), 2)
+        self.assertTrue(all(arms == {"left", "right"} for arms in stop_states))
+        self.assertEqual(sum(event_type == "arm_finalization_cancelled" for event_type, _ in events), 2)
+
+    def test_catalog_revision_is_optional_opaque_and_fingerprinted(self):
+        live_catalog = Catalog(self.gateway.scene, "live")
+        mock_catalog = Catalog(self.gateway.scene, "mock")
+        self.assertEqual(live_catalog.snapshot()["execution_profile"]["cross_arm_motion_concurrency"], 2)
+        self.assertEqual(mock_catalog.snapshot()["execution_profile"]["cross_arm_motion_concurrency"], 2)
+        self.assertNotEqual(live_catalog.revision, mock_catalog.revision)
+        self.assertEqual(live_catalog.snapshot()["catalog_revision"], live_catalog.revision)
+
+        base = wait_package("revision-fingerprint")
+        fingerprints = []
+        for revision in ("random-upstream-value", 847263, None,
+                         {"source": "caller"}, [7, "snapshot"]):
+            graph = copy.deepcopy(base)
+            graph["catalog_revision"] = revision
+            caller_copy = copy.deepcopy(graph)
+            plan = live_catalog.validate(graph)
+            self.assertEqual(graph, caller_copy, "Validation must preserve caller-owned data")
+            self.assertEqual(plan.package, caller_copy)
+            self.assertEqual(plan.fingerprint, digest(caller_copy))
+            self.assertEqual(plan.package["catalog_revision"], revision)
+            fingerprints.append(plan.fingerprint)
+        self.assertEqual(len(fingerprints), len(set(fingerprints)),
+                         "Different catalog_revision metadata must produce different fingerprints")
+
+        without_metadata = wait_package("revision-fingerprint-optional")
+        plan = live_catalog.validate(without_metadata)
+        self.assertNotIn("catalog_revision", plan.package)
+        self.assertEqual(plan.fingerprint, digest(without_metadata))
+
+    def test_execution_and_two_phase_routes_preserve_optional_catalog_metadata(self):
+        for index, revision in enumerate((None, "random-http-metadata", 912345.625)):
+            suffix = "metadata-%d" % index
+            graph = wait_package(suffix + "-fresh", revision)
+            original = copy.deepcopy(graph)
+            code, response = self.request("/v1/execute-graph", {"graph": graph})
+            self.assertEqual(code, 202)
+            self.assertEqual(self.finish(response["execution_id"])["status"], "succeeded")
+            stored = self.gateway.store.get(response["execution_id"])
+            self.assertEqual(stored["package"], original)
+
+            graph = wait_package(suffix + "-idempotent", revision)
+            original = copy.deepcopy(graph)
+            code, response = self.request(
+                "/v1/execute-graph/idempotent", {"graph": graph}, "dispatch-" + suffix)
+            self.assertEqual(code, 202)
+            self.assertEqual(self.finish(response["execution_id"])["status"], "succeeded")
+            stored = self.gateway.store.get(response["execution_id"])
+            self.assertEqual(stored["package"], original)
+
+            graph = wait_package(suffix + "-two-phase", revision)
+            original = copy.deepcopy(graph)
+            code, validation = self.request(
+                "/device-gateway/v1/execution-plans/validate", {"package": graph}, "validate-" + suffix)
+            self.assertEqual(code, 200)
+            self.assertEqual(validation["package"], original)
+            code, response = self.request(
+                "/device-gateway/v1/executions",
+                {"package": graph, "validation_token": validation["validation_token"]}, "two-phase-" + suffix)
+            self.assertEqual(code, 202)
+            self.assertEqual(self.finish(response["execution_id"])["status"], "succeeded")
+            stored = self.gateway.store.get(response["execution_id"])
+            self.assertEqual(stored["package"], original)
+
     def test_authentication_request_shape_and_resume_rejected(self):
         self.assertEqual(self.request("/v1/catalog", authorized=False)[0], 401)
         graph = package(self.gateway.catalog.revision)
-        self.assertEqual(self.request("/v1/execute-graph", {"graph": graph})[0], 422)
-        self.assertEqual(self.request("/v1/execute-graph", {"graph": graph, "resume_from_node_id": "pick-A"}, "x")[1]["code"], "UNSUPPORTED_RESUME")
-        self.assertEqual(self.request("/v1/execute-graph", {"graph": graph, "mode": "live"}, "x")[1]["code"], "INVALID_REQUEST")
+        idempotent_path = "/v1/execute-graph/idempotent"
+        self.assertEqual(self.request(idempotent_path, {"graph": graph})[0], 422)
+        self.assertEqual(self.request(idempotent_path, {"graph": graph, "resume_from_node_id": "pick-A"}, "x")[1]["code"], "UNSUPPORTED_RESUME")
+        self.assertEqual(self.request(idempotent_path, {"graph": graph, "mode": "live"}, "x")[1]["code"], "INVALID_REQUEST")
+
+    def test_removed_repeat_route_returns_not_found(self):
+        graph = package(self.gateway.catalog.revision)
+        code, response = self.request("/v1/execute-graph/repeat", {"graph": graph}, "fixed-key")
+        self.assertEqual((code, response["code"]), (404, "NOT_FOUND"))
 
     def test_compiler_catalog_fetch_and_event_delivery_survive_registration_race(self):
         compiler = ThreadingHTTPServer(("127.0.0.1", 0), CompilerHandler)

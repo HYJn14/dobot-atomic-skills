@@ -65,13 +65,13 @@ Authorization: Bearer <token>
 
 能力目录包含 `catalog_revision`、`devices`、`atomic_skills` 和 `execution_profile`。目录响应自身的 `schema_version` 为 1.0，与运行包版本 2.1 是不同字段。
 
-上游系统应按目录选择设备、技能和版本，将返回的 `catalog_revision` 原样写入运行包。网关依据场景、模式和技能版本生成目录修订标识；Mock 与真机目录不可互换。
+上游系统可按目录选择设备、技能和版本。运行包可省略 `catalog_revision`；如提供，入参可为任意有限 JSON 值，网关会原样保留并纳入完整包指纹，不会与当前目录修订值比较。`GET /v1/catalog` 和健康响应中由网关生成的修订值仍描述当前目录，供查看或由上游自行记录。网关仍独立验证场景复位、真机就绪、设备、技能和参数；Mock 与真机目录不可互换。
 
 ## 2.3 健康与就绪
 
 `GET /health` 返回 `status`、`mode`、`catalog_revision`、`active_execution_id` 和 `quarantined`。`status=ok` 表示 HTTP 服务可响应，不表示真机已就绪。真机就绪检查、设备独占与场景一致性在执行链路中继续验证。
 
-> 目录过期：收到 STALE_CATALOG_REVISION 后，重新读取目录并由上游重新编译运行包。不得仅替换旧包中的目录标识后重发。
+> 场景复位：内部场景 stamp 检查与运行包里的可选 `catalog_revision` 元数据无关，仍须通过 operator 确认真机初始状态。
 
 <!-- page -->
 
@@ -123,7 +123,7 @@ Authorization: Bearer <token>
 | schema_version / graph_version | 固定为字符串 2.1 / 0.1。 |
 | package_id | 必填非空标识，最长 200 字符；用作图标识。 |
 | experiment_id | 必填非空实验标识，最长 200 字符。 |
-| catalog_revision | 必须与当前能力目录一致。 |
+| catalog_revision | 可选；任意有限 JSON 元数据，原样保留并参与完整包指纹，不与当前目录修订值比较。 |
 | entry_node_ids | 必须准确列出所有无前驱节点。 |
 | nodes | 1 至 100 个节点；node_id 唯一。 |
 | edges | 每条包含 source、target、edge_type；只支持 success。 |
@@ -153,7 +153,7 @@ Authorization: Bearer <token>
 
 # 05 单臂运行包示例
 
-下例描述左臂抓取 A 并放置到目标 A。`catalog_revision` 必须来自当前目录；任务与幂等标识由调用方生成。完整可复用文件见 `examples/runtime-single-arm.json`。
+下例描述左臂抓取 A 并放置到目标 A。示例中的 `catalog_revision` 是任意上游元数据；字段也可省略。任务与幂等标识由调用方生成。
 
 ```json
 {
@@ -162,7 +162,7 @@ Authorization: Bearer <token>
   "package_id": "runtime-single-001",
   "run_id": "single-001",
   "experiment_id": "experiment-001",
-  "catalog_revision": "CATALOG_REVISION_FROM_GATEWAY",
+  "catalog_revision": "upstream-snapshot-42",
   "entry_node_ids": ["pick-A"],
   "nodes": [
     {
@@ -306,7 +306,6 @@ Content-Type: application/json
 
 | 错误码 | 处理 |
 | --- | --- |
-| STALE_CATALOG_REVISION | 重新读取目录并重新编译。 |
 | IDEMPOTENCY_CONFLICT | 核对包和请求键，停止盲目重试。 |
 | RESOURCE_CONFLICT | 查询现有执行及控制所有者。 |
 | VALIDATION_TOKEN_EXPIRED | 使用新预检键重新预检。 |
@@ -444,12 +443,12 @@ python -B -m task_skills.run_gateway `
 
 # 12 联调验收与维护
 
-联调按合同、Mock、真机三阶段推进。每阶段保存运行包、目录修订、执行标识、节点状态、事件与错误记录；避免只保存终态截图。
+联调按合同、Mock、真机三阶段推进。每阶段保存运行包、目录快照、执行标识、节点状态、事件与错误记录；避免只保存终态截图。
 
 | 检查项 | 验收要求 |
 | --- | --- |
-| 合同与版本 | 双方使用同一目录修订、设备与技能版本；合法包可校验。 |
-| 拒绝行为 | 环、未知技能、不支持节点或边、错绑对象及过期目录被稳定拒绝。 |
+| 合同与版本 | 双方使用匹配的设备与技能版本；包内目录修订元数据可省略且不参与兼容性判断。 |
+| 拒绝行为 | 环、未知技能、不支持节点或边及错绑对象被稳定拒绝。 |
 | 单次与两阶段 | 两条提交链路均可追溯到执行标识与节点终态。 |
 | 幂等 | 重试原键及原包不重复执行；换包和节点键复用可识别。 |
 | 依赖 | 双臂示例的返程抓取等待两次放置均成功。 |

@@ -64,7 +64,8 @@ class Catalog:
         self.scene = scene
         self.mode = mode
         self.revision = "dobot-" + digest({"scene": asdict(scene), "profile": "dobot-dag/1",
-                                           "mode": mode, "skill_version": "1.0.0"})[:20]
+                                           "mode": mode, "skill_version": "1.0.0",
+                                           "cross_arm_motion_concurrency": 2})[:20]
 
     def snapshot(self):
         devices = []
@@ -109,7 +110,7 @@ class Catalog:
                     "wait_shape": {"duration_s": "number 0..60"},
                     "edge_shape": {"source": "node_id", "target": "node_id", "edge_type": "success"},
                     "supports_resume": False, "maximum_nodes": 100,
-                    "cross_arm_motion_concurrency": 2 if self.mode == "mock" else 1,
+                    "cross_arm_motion_concurrency": 2,
                     "requires_initial_home": self.mode == "live",
                     "condition_ids": ["motion_sequence_completed", "wait_elapsed"],
                     "hardware_connected": False}}
@@ -124,8 +125,6 @@ class Catalog:
         package = copy.deepcopy(package)
         if package.get("schema_version") != "2.1" or package.get("graph_version") != "0.1":
             raise ContractError("UNSUPPORTED_SCHEMA", "Supported schema_version=2.1, graph_version=0.1")
-        if package.get("catalog_revision") != self.revision:
-            raise ContractError("STALE_CATALOG_REVISION", "Obtain the current catalog and recompile", "catalog_revision", 409)
         graph_id = identifier(package.get("package_id"), "package_id")
         identifier(package.get("experiment_id"), "experiment_id")
         if package.get("graph_id", graph_id) != graph_id:

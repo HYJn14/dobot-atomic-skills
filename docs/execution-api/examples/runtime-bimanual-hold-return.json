@@ -6,7 +6,7 @@
   "experiment_id": "experiment-manual-bimanual-001",
   "recipe_id": "dobot-hold-return",
   "version": "1.0",
-  "catalog_revision": "CATALOG_REVISION_FROM_GATEWAY",
+  "catalog_revision": "caller-snapshot-001",
   "entry_node_ids": [
     "pick-A",
     "pick-B"

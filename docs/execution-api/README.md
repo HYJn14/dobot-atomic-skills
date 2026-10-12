@@ -42,7 +42,8 @@ python -B -m task_skills.gateway.operator --mode mock --data-dir ./gateway-data/
 |---|---|
 | `GET /health` | 模式、目录版本、执行占用及隔离状态 |
 | `GET /v1/catalog`（别名 `/v1/capabilities`） | 本机设备、技能、固定物体/位置绑定和执行子集 |
-| `POST /v1/execute-graph` | `{"graph": RuntimeExecutionPackage}`，202 返回 `execution_id/status/graph_id/accepted_at` |
+| `POST /v1/execute-graph` | `{"graph": RuntimeExecutionPackage}`，每个接收请求创建新执行；202 返回 `execution_id/status/graph_id/accepted_at` |
+| `POST /v1/execute-graph/idempotent` | 幂等单次提交；使用 `Idempotency-Key` 或 `request_id` 去重 |
 | `POST /device-gateway/v1/execution-plans/validate` | `{"package": RuntimeExecutionPackage,"reserve_resources":true}`，返回绑定包的 `validation_token`；默认预留 60 秒 |
 | `POST /device-gateway/v1/executions` | `{"package": RuntimeExecutionPackage,"validation_token":"..."}`，正式执行 |
 | `GET /v1/executions/{id}` | 总状态、节点状态、错误、物体逻辑状态与证据等级 |
@@ -50,11 +51,15 @@ python -B -m task_skills.gateway.operator --mode mock --data-dir ./gateway-data/
 | `POST /v1/executions/{id}/cancel` | 请求体 `{}`；发起停止，可继续查询终态 |
 | `GET /v1/delivery-status` | 回传待投递、已确认、错误与是否配置上游 |
 
-查询/事件/取消也支持 `/device-gateway/v1/executions/{id}` 前缀。JSON 请求必须 `Content-Type: application/json`，不支持 chunked，最大 2 MiB。所有预检/提交必须带 `Idempotency-Key`，或请求体 `request_id`；两者都有时必须相同。同一请求键+同一原始包返回原会话，不重复动作；换包报 409。每个动作还必须带唯一 `skill_invocation.idempotency_key`，已使用的节点键不能交给另一个会话。
+查询/事件/取消也支持 `/device-gateway/v1/executions/{id}` 前缀。JSON 请求必须 `Content-Type: application/json`，不支持 chunked，最大 2 MiB。`/v1/execute-graph/idempotent`、两阶段预检和正式提交必须带 `Idempotency-Key`，或请求体 `request_id`；两者都有时必须相同。同一请求键+同一原始包返回原会话，不重复动作；换包报 409。每个动作还必须带唯一 `skill_invocation.idempotency_key`，已使用的节点键不能交给另一个会话。
+
+`POST /v1/execute-graph` 每次接收有效请求都创建新执行，不需要 `Idempotency-Key`。它只接受直接传入的完整 `graph` 或 `package`（两者只能有一个），不使用上游 `run_id` 拉图，也不接受预检 token、恢复或模式字段。若提供 `request_id`，必须是有效 ID，但不会用于去重。网关在包的深拷贝上生成唯一 dispatch key 和每个动作新的 `skill_invocation.idempotency_key`，同时保留 `package_id`、包内 `run_id` 和 `node_id`。因此自动重试或重复点击会创建另一份执行；依然受执行占用、预留、隔离、场景/物体状态及设备锁检查约束，不会取消当前任务或复位场景。需要网络重试保持幂等的自动化客户端应使用 `/v1/execute-graph/idempotent`；两阶段接口行为不变。
+
+live 图执行完成后，网关为每个参与臂发送 `arm_finalizing` 和 `arm_finalized` 事件；归位失败或取消时发送 `arm_finalization_failed` 或 `arm_finalization_cancelled`。臂标识位于事件的 `payload.arm`，归位状态和反馈也在 payload 中。这些执行级事件不对应图节点，不包含 `node_id`。
 
 ## 当前可执行的图
 
-基础形状见 [runtime-package.profile.schema.json](runtime-package.profile.schema.json)，完整模板见 [runtime-package.example.json](runtime-package.example.json)。模板的目录版本是占位值，须由上游按本机当前目录生成新包，不能给旧图静默换版本。
+基础形状见 [runtime-package.profile.schema.json](runtime-package.profile.schema.json)，完整模板见 [runtime-package.example.json](runtime-package.example.json)。运行包可省略 `catalog_revision`；如提供，入参值可为任意有限 JSON 元数据，网关会原样保留并纳入完整包指纹，不与本机目录修订值比较。`GET /v1/catalog` 中网关生成的 `catalog_revision` 仍表示当前目录，仅供查看或由上游自行记录。样例值只作任意元数据示例。
 
 | 项目 | 当前合同 |
 |---|---|
@@ -68,9 +73,9 @@ python -B -m task_skills.gateway.operator --mode mock --data-dir ./gateway-data/
 | 完成条件 | action: `motion_sequence_completed`；wait: `wait_elapsed`，可省略使用默认 |
 | 超时 | 每技能总时间 `timeout_s` 0.01–900 秒，默认 180 秒，包含该技能内部步骤与资源等待 |
 | 失败 | 立即停止下游并保留证据；接受 `on_fail` 的外部决策元数据，但不会本地重试/修改图/启动恢复节点 |
-| 资源 | 单 rig 一个执行；同臂动作必须显式依赖；mock 跨臂可并行，live 使用共享工作区保守串行 |
+| 资源 | 单 rig 一个执行；同臂动作必须显式依赖并串行执行；mock/live 独立跨臂动作可并行，最多左右臂各一个 |
 
-拒绝环、未知技能、未知条件、额外 preconditions/abort_conditions、非 success 边、`condition/observe/parallel/human_approval/recovery` 节点及断点续跑。并行通过多入口 DAG 表达。拒绝不能实现的安全条件，而不是忽略它。必须锁定当前 `catalog_revision`，过期目录报 `STALE_CATALOG_REVISION`。所有图必须让已抓取物体最终释放；执行成功后保存命令层逻辑位置，现场传感器尚不能独立验证物体是否实际到位。
+拒绝环、未知技能、未知条件、额外 preconditions/abort_conditions、非 success 边、`condition/observe/parallel/human_approval/recovery` 节点及断点续跑。并行通过多入口 DAG 表达。拒绝不能实现的安全条件，而不是忽略它。目录修订值不作为运行包兼容性门槛；场景 stamp 的内部复位检查仍独立生效。所有图必须让已抓取物体最终释放；执行成功后保存命令层逻辑位置，现场传感器尚不能独立验证物体是否实际到位。
 
 失败后的恢复、重新感知和派生图由上游决策。当前 fresh-run 子集不提供恢复节点/断点动作；真机失败后需现场复位再执行新图。双方仍须确认正式 JSON Schema、完整 typed-edge/wait/条件结构、取消合同及事件 ACK。
 
@@ -100,13 +105,13 @@ $env:DOBOT_GATEWAY_TOKEN = '<现场注入令牌>'
 python -B -m task_skills.run_gateway --mode live --allow-live --data-dir ./gateway-data/live
 ```
 
-所有代码副本与旧控制入口必须使用同一 `DOBOT_DEVICE_LOCK_PATH`；未升级的旧进程不能被此协作锁约束。网关会检查 controller 模式/home，设置 10% 速度，成功结束后将参与臂归 home；不会自动清报警、使能或在启动时移动机械臂。共享场景 stamp 绑定唯一 registry、复位 epoch 与目录版本，另一个数据目录的复位会使旧目录失效；数据库固定 mock/live 模式，不能混用。
+所有代码副本与旧控制入口必须使用同一 `DOBOT_DEVICE_LOCK_PATH`；未升级的旧进程不能被此协作锁约束。网关会检查 controller 模式/home，将速度倍率、关节/直线速度及加速度参数设为 20%；成功结束时所有参与臂并行归 home，并等待全部归位完成后才报告成功。不会自动清报警、使能或在启动时移动机械臂。内部场景 stamp 绑定唯一 registry、复位 epoch 与场景修订，另一个数据目录的复位会使旧目录失效；数据库固定 mock/live 模式，不能混用。
 
 取消/失败停止双臂、夹爪原位 hold 并检查稳定反馈；停止后命令 gate 禁止追加动作，全部执行线程退出后再次验证停止。停止未确认或真机执行未完整结束会隔离 rig，不再接新执行。ZMQ 老入口退出没有可靠停止验证，因此保留 owner 锁。不要自动回原点、松爪或清除这个锁。
 
 恢复顺序：关闭控制进程并现场确认机器人/夹爪已静止 → 人工处理未完成任务并恢复初始场景 → 核实 `owner.json` 对应进程已退出后由现场管理员清除该 owner 目录 → 对同一 live 数据目录运行上述 operator 命令 → 重启网关。operator 不删 owner 锁、不连接设备、不删执行历史。未知进程/未知持物状态必须先现场处理。
 
-证据等级为 `command_trace`：控制器位姿与夹爪反馈可证明指令执行过程，不能独立证明抓住/放准物体。本子集的共享工作区锁也不代替真机碰撞检测、PLC 或硬件急停。
+证据等级为 `command_trace`：控制器位姿与夹爪反馈可证明指令执行过程，不能独立证明抓住/放准物体。跨臂并行不代替真机碰撞检测、PLC 或硬件急停。
 
 ## 离线验证
 

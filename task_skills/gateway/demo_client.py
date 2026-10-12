@@ -42,11 +42,12 @@ def main(argv=None):
     parser.add_argument("--two-phase", action="store_true")
     parser.add_argument("--package", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--write-template", type=Path, help="Write an offline example with placeholder catalog revision")
+    parser.add_argument("--write-template", type=Path, help="Write an offline example with opaque catalog_revision metadata")
     args = parser.parse_args(argv)
     if args.write_template:
         args.write_template.parent.mkdir(parents=True, exist_ok=True)
-        args.write_template.write_text(json.dumps(demo_package("CATALOG_REVISION_FROM_GATEWAY", "example-001"), indent=2), encoding="utf-8")
+        args.write_template.write_text(
+            json.dumps(demo_package("example-catalog-metadata", "example-001"), indent=2), encoding="utf-8")
         return 0
     token = os.environ.get("DOBOT_GATEWAY_TOKEN")
     transport = Upstream(args.url, token)
@@ -75,7 +76,8 @@ def main(argv=None):
     if catalog["execution_profile"]["mode"] != "mock":
         parser.error("This demo client only dispatches to mock mode")
     run_id = "demo-" + uuid4().hex
-    graph = json.loads(args.package.read_text(encoding="utf-8")) if args.package else demo_package(catalog["catalog_revision"], run_id)
+    graph = (json.loads(args.package.read_text(encoding="utf-8")) if args.package
+             else demo_package(catalog["catalog_revision"], run_id))
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps({"graph": graph}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -84,7 +86,7 @@ def main(argv=None):
         result = request("/device-gateway/v1/executions", {"package": graph,
                          "validation_token": validation["validation_token"]}, "dispatch-" + run_id)
     else:
-        result = request("/v1/execute-graph", {"graph": graph}, "dispatch-" + run_id)
+        result = request("/v1/execute-graph/idempotent", {"graph": graph}, "dispatch-" + run_id)
     execution_id = result["execution_id"]
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:

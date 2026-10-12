@@ -1,5 +1,6 @@
 """One execution owner behind both single-push and two-phase protocols."""
 
+import copy
 import json
 import os
 import threading
@@ -124,15 +125,16 @@ class Gateway:
         with self.lock:
             old = self.store.reservation_by_key(key)
             if old:
+                old_response = json.loads(old["response"])
                 if old["digest"] != plan.fingerprint:
                     raise ContractError("IDEMPOTENCY_CONFLICT", "Preflight key used for another package", status=409)
                 if old["expires"] <= time.time() and not old["execution_id"]:
                     raise ContractError("VALIDATION_TOKEN_EXPIRED", "Use a new preflight key", status=409)
                 if not old["execution_id"] and old["token"] != self.reservation_token:
                     raise ContractError("RESERVATION_EXPIRED", "Preflight reservation was lost; use a new key", status=409)
-                if json.loads(old["response"]).get("reserve_resources", True) != reserve:
+                if old_response.get("reserve_resources", True) != reserve:
                     raise ContractError("IDEMPOTENCY_CONFLICT", "reserve_resources differs from original preflight", status=409)
-                return json.loads(old["response"])
+                return old_response
             self._available()
             if self.reservation_token:
                 raise ContractError("RESOURCE_CONFLICT", "Another preflight reserved the rig", status=409)
@@ -195,6 +197,30 @@ class Gateway:
             self.worker.start()
             return self._response(record)
 
+    def submit_new_execution(self, body):
+        """Submit a fresh execution of a direct package with server-generated keys."""
+        if not isinstance(body, dict):
+            raise ContractError("INVALID_REQUEST", "Request must be a JSON object", status=400)
+        if set(body) - {"graph", "package", "request_id"}:
+            raise ContractError("INVALID_REQUEST", "Repeat accepts only graph/package and optional request_id", status=400)
+        if "graph" in body and "package" in body:
+            raise ContractError("INVALID_REQUEST", "Supply graph or package, not both", status=400)
+        package = body.get("graph", body.get("package"))
+        if package is None:
+            raise ContractError("MISSING_EXECUTION_PACKAGE", "A complete execution package is required")
+        if "request_id" in body:
+            identifier(body["request_id"], "request_id")
+
+        # Validate the caller's package before changing any idempotency data. Catalog.validate
+        # also returns a deep copy, so caller-owned request data remains untouched.
+        plan = self.catalog.validate(package, check_state=False)
+        repeated_package = copy.deepcopy(plan.package)
+        dispatch_key = "repeat-" + uuid4().hex
+        for node in repeated_package["nodes"]:
+            if node["node_type"] == "action":
+                node["skill_invocation"]["idempotency_key"] = "repeat-" + uuid4().hex
+        return self.submit({"graph": repeated_package, "request_id": dispatch_key}, dispatch_key)
+
     @staticmethod
     def _response(record):
         return {"execution_id": record["id"], "status": record["status"], "graph_id": record["package"]["package_id"],
@@ -254,7 +280,7 @@ class Gateway:
         with self.lock:
             record = self.store.get(execution_id)
             return {**self._response(record), "node_statuses": record["node_statuses"], "error": record["error"],
-                    "catalog_revision": record["package"]["catalog_revision"], "mode": self.mode,
+                    "catalog_revision": record["package"].get("catalog_revision", self.catalog.revision), "mode": self.mode,
                     "modeled_object_state": self.store.object_state(),
                     "verification": {"level": "command_trace", "physical_success_verified": False}}
 

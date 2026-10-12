@@ -47,7 +47,6 @@ def run_graph(plan, adapter, scene, directory, cancel, emit, live=False):
     journal = ExecutionJournal(directory)
     (directory / "submitted_package.json").write_text(canonical(plan.package), encoding="utf-8")
     completed, futures, active_arms = set(), {}, set()
-    shared_workspace = threading.Lock()
     first_error = None
     stop_result = None
     nodes = {n["node_id"]: n for n in plan.package["nodes"]}
@@ -83,10 +82,6 @@ def run_graph(plan, adapter, scene, directory, cancel, emit, live=False):
                     "verification": {"level": "command_trace", "physical_success_verified": False},
                     "hardware_connected": live}
 
-        if live and plan.arms[node_id] != "system":
-            # Conservative shared-table resource; this is not realtime collision avoidance.
-            with shared_workspace:
-                return execute_steps()
         return execute_steps()
 
     def request_stop(force=False):
@@ -110,7 +105,7 @@ def run_graph(plan, adapter, scene, directory, cancel, emit, live=False):
                 measured = DobotHardwareAdapter._numeric_payload(snapshot["joints"])
                 if len(measured) != 6 or not DobotHardwareAdapter._target_matches(measured, physical_nova_home_degrees(arm), 0):
                     raise RuntimeError("Both arms must start at their calibrated home pose")
-                adapter.configure_robot(arm, 10)
+                adapter.configure_robot(arm, 20)
         emit("execution_started", status="running")
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="dobot-skill") as pool:
             while len(completed) < len(plan.order):
@@ -160,9 +155,117 @@ def run_graph(plan, adapter, scene, directory, cancel, emit, live=False):
             raise RuntimeError("DAG scheduler made no progress")
         if live:
             emit("execution_finalizing", status="finalizing")
-            for arm in sorted(set(plan.arms.values()) - {"system"}):
-                adapter.execute_atomic(AtomicNode("final:" + arm, 0, "move_safe_pose", arm, timeout_seconds=180), scene)
-        return {"status": "succeeded", "feedback": adapter.snapshot_all(),
+            arms = sorted(set(plan.arms.values()) - {"system"})
+            home_futures, submitted_arms = {}, set()
+            home_failure, interrupted_arm = None, None
+            finalization_cancelled = False
+            current_arm = None
+
+            def execute_final_home(arm):
+                if cancel.is_set():
+                    raise InterruptedError("Execution cancelled before final homing")
+                node = AtomicNode("final:" + arm, 0, "move_safe_pose", arm, timeout_seconds=180)
+                return adapter.execute_atomic(node, scene)
+
+            if arms:
+                with ThreadPoolExecutor(max_workers=len(arms), thread_name_prefix="dobot-home") as pool:
+                    try:
+                        for arm in arms:
+                            current_arm = arm
+                            if cancel.is_set():
+                                finalization_cancelled = True
+                                if interrupted_arm is None:
+                                    interrupted_arm = arm
+                                request_stop()
+                                break
+                            emit("arm_finalizing", payload={"arm": arm, "status": "finalizing"})
+                            home_futures[pool.submit(execute_final_home, arm)] = arm
+                            submitted_arms.add(arm)
+                        for arm in arms:
+                            if arm not in submitted_arms:
+                                current_arm = arm
+                                emit("arm_finalization_cancelled",
+                                     payload={"arm": arm, "status": "cancelled"})
+
+                        while home_futures:
+                            if cancel.is_set():
+                                finalization_cancelled = True
+                                if interrupted_arm is None and home_futures:
+                                    interrupted_arm = next(iter(home_futures.values()))
+                                request_stop()
+                            ready, _ = wait(tuple(home_futures), timeout=0.05, return_when=FIRST_COMPLETED)
+                            for future in ready:
+                                arm = home_futures.pop(future)
+                                current_arm = arm
+                                try:
+                                    evidence = future.result()
+                                except InterruptedError as error:
+                                    finalization_cancelled = True
+                                    if interrupted_arm is None:
+                                        interrupted_arm = arm
+                                    cancel.set()
+                                    request_stop()
+                                    emit("arm_finalization_cancelled",
+                                         payload={"arm": arm, "status": "cancelled",
+                                                  "exception_type": type(error).__name__},
+                                         error={"code": "EXECUTION_CANCELLED", "retryable": False})
+                                except Exception as error:
+                                    code = "MOTION_TIMEOUT" if isinstance(error, TimeoutError) else "FINAL_HOME_FAILED"
+                                    if home_failure is None:
+                                        home_failure = {"code": code, "retryable": False, "phase": "final_home",
+                                                        "arm": arm, "exception_type": type(error).__name__}
+                                    cancel.set()
+                                    request_stop()
+                                    emit("arm_finalization_failed",
+                                         payload={"arm": arm, "status": "failed",
+                                                  "exception_type": type(error).__name__},
+                                         error={"code": code, "retryable": False})
+                                else:
+                                    emit("arm_finalized", payload={"arm": arm, "status": "succeeded",
+                                                                   "evidence": evidence})
+                    except Exception as error:
+                        # Event persistence or submission can fail while another home is active.
+                        # Stop before the executor context waits for its workers to finish.
+                        if home_failure is None:
+                            home_failure = {"code": "FINALIZATION_EVENT_FAILED", "retryable": False,
+                                            "phase": "final_home", "arm": current_arm,
+                                            "exception_type": type(error).__name__}
+                        cancel.set()
+                        finalization_cancelled = True
+                        request_stop()
+                        while home_futures:
+                            ready, _ = wait(tuple(home_futures), timeout=0.05, return_when=FIRST_COMPLETED)
+                            for future in ready:
+                                arm = home_futures.pop(future)
+                                try:
+                                    future.result()
+                                except InterruptedError:
+                                    if interrupted_arm is None:
+                                        interrupted_arm = arm
+                                except Exception:
+                                    pass
+
+            if cancel.is_set():
+                finalization_cancelled = True
+            if home_failure or finalization_cancelled:
+                # Stop promptly above, then verify again after every home worker has exited.
+                request_stop(force=True)
+                error = home_failure or {"code": "EXECUTION_CANCELLED", "retryable": False,
+                                         "phase": "final_home"}
+                if not home_failure and interrupted_arm:
+                    error["arm"] = interrupted_arm
+                return {"status": "failed" if home_failure else "cancelled", "error": error,
+                        "stop": stop_result,
+                        "verification": {"level": "command_trace", "physical_success_verified": False}}
+        feedback = adapter.snapshot_all()
+        if live and cancel.is_set():
+            request_stop()
+            request_stop(force=True)
+            return {"status": "cancelled",
+                    "error": {"code": "EXECUTION_CANCELLED", "retryable": False, "phase": "final_home"},
+                    "stop": stop_result,
+                    "verification": {"level": "command_trace", "physical_success_verified": False}}
+        return {"status": "succeeded", "feedback": feedback,
                 "verification": {"level": "command_trace", "physical_success_verified": False},
                 "hardware_connected": live}
     except Exception as error:

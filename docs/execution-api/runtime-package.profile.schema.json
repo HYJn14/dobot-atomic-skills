@@ -1,15 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Dobot dobot-dag/1 supported RuntimeExecutionPackage 2.1 shapes",
-  "description": "Local supported profile, not the partner's official full schema. Runtime also checks catalog revision, dependencies, calibrated bindings, resource ordering, object lifecycle and idempotency.",
+  "description": "Local supported profile, not the partner's official full schema. Runtime also checks dependencies, calibrated bindings, resource ordering, object lifecycle and idempotency.",
   "type": "object",
-  "required": ["schema_version", "graph_version", "package_id", "experiment_id", "catalog_revision", "nodes", "edges"],
+  "required": ["schema_version", "graph_version", "package_id", "experiment_id", "nodes", "edges"],
   "properties": {
     "schema_version": {"const": "2.1"},
     "graph_version": {"const": "0.1"},
     "package_id": {"$ref": "#/$defs/id"},
     "experiment_id": {"$ref": "#/$defs/id"},
-    "catalog_revision": {"$ref": "#/$defs/id"},
+    "catalog_revision": {"description": "Optional opaque caller metadata, preserved and included in the package fingerprint; not compared with the gateway catalog."},
     "entry_node_id": {"$ref": "#/$defs/id"},
     "entry_node_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
     "nodes": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"oneOf": [{"$ref": "#/$defs/action"}, {"$ref": "#/$defs/wait"}]}},

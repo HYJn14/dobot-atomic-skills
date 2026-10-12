@@ -4,7 +4,7 @@
   "package_id": "runtime-single-001",
   "run_id": "single-001",
   "experiment_id": "experiment-001",
-  "catalog_revision": "CATALOG_REVISION_FROM_GATEWAY",
+  "catalog_revision": 847263,
   "entry_node_ids": [
     "pick-A"
   ],
