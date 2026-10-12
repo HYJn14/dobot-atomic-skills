@@ -56,7 +56,7 @@ python -B tests/gateway_cli_smoke.py --output ./gateway-data/cli-smoke
 | 内容 | 位置 |
 | --- | --- |
 | 当前 HTTP 合同、双方操作、幂等与现场恢复 | [docs/execution-api/README.md](docs/execution-api/README.md) |
-| 原子技能执行接口与联调手册（13 页 PDF） | [联调手册 v1.0](docs/execution-api/Dobot_原子技能执行接口与联调手册_v1.0.pdf) |
+| 原子技能执行接口与联调手册（14 页 PDF） | [联调手册 v1.1](docs/execution-api/Dobot_原子技能执行接口与联调手册_v1.1.pdf) |
 | 外部运行包示例 | [runtime-package.example.json](docs/execution-api/runtime-package.example.json) |
 | 受限 profile Schema | [runtime-package.profile.schema.json](docs/execution-api/runtime-package.profile.schema.json) |
 | 中文指令与底层执行图 | [task_skills/README.md](task_skills/README.md) |

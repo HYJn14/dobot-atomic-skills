@@ -21,3 +21,4 @@ task_skills/artifacts/
 *.h5
 *.swp
 *.swo
+.font-cache/
