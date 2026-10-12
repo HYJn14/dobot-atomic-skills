@@ -14,6 +14,32 @@
 
 外部合同使用 `RuntimeExecutionPackage 2.1`、`graph_version=0.1`、`dobot-dag/1`。目前支持 `embodied.pick@1.0.0`、`embodied.place@1.0.0`、`wait` 和 success AND 依赖；位置由本机场景标定解析。Mock 可跨臂并行，外部网关 live 模式对共享工作区保守串行。
 
+## 本地单臂与双臂操作
+
+在仓库根目录运行，先预览执行图。以下命令不连接机械臂：
+
+```powershell
+# 左臂：A → 目标 A
+python -X utf8 -B -m task_skills.run_task "把物体A抓取放到目标A" --dry-run
+
+# 右臂：B → 目标 B
+python -X utf8 -B -m task_skills.run_task "把物体B抓取放到目标B" --dry-run
+
+# 双臂顺序执行：左臂完成后，再执行右臂
+python -X utf8 -B -m task_skills.run_task "把物体A抓取放到目标A，然后把物体B抓取放到目标B" --dry-run
+
+# 双臂协调：并行抓取、左臂保持 5 秒、放置后右臂取回 B
+$task = '用左臂把物体A拿起来，然后右臂把物体B拿起来。' +
+        '左臂拿起物体A以后保持5秒，右臂直接送到目标B。' +
+        '然后5s后左臂再把物体A送到目标A。' +
+        '随后右臂把物体B从目标B拿起来放回物体B原来的位置。'
+python -X utf8 -B -m task_skills.run_task "$task" --dry-run
+```
+
+真机执行使用已配置硬件依赖的 Windows 环境：完成现场检查后，去掉 `--dry-run`，核对打印的执行图，再按提示输入大写 `YES`。该入口直接使用设备适配器，不需要启动 HTTP 网关或 `launch_nodes.py`。固定绑定为左臂 A、右臂 B。
+
+[本地单臂与双臂操作说明](docs/local-control.md)包含完整真机命令、设备锁、初始场景、归位语义和结果文件说明。
+
 ## 快速开始：Mock 联调
 
 使用 Python 3.10 或更新版本，在仓库根目录运行。HTTP Mock 网关只需 Python 标准库，无需机械臂或完整训练环境。

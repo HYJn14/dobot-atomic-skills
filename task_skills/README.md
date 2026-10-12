@@ -40,6 +40,9 @@ feedback and stabilization before the graph can advance.
 
 ## Natural-language atomic runner
 
+For complete left-arm, right-arm, sequential bimanual and coordinated
+hold-and-return commands, see the [local control guide](../docs/local-control.md).
+
 Preview a natural-language task without connecting to hardware:
 
 ```bash
