@@ -67,7 +67,16 @@ class AtomicGraphExecutor:
         graph.status = "succeeded"
         graph.completed_at = utc_now()
         self.journal.write_graph(graph)
-        self.journal.write_atomic_summary(graph, self.adapter.snapshot_all())
+        final_state = self._safe_snapshot_all()
+        if isinstance(final_state, dict) and "snapshot_error" in final_state:
+            warning = "Final diagnostic snapshot failed after all atomic nodes succeeded."
+            self.journal.record(
+                "final_snapshot_failed",
+                warning=warning,
+                snapshot_error=final_state["snapshot_error"],
+            )
+            final_state = {**final_state, "warning": warning}
+        self.journal.write_atomic_summary(graph, final_state)
         return graph
 
     def _schedule_ready_nodes(self, graph, executor, futures, active_arms) -> None:

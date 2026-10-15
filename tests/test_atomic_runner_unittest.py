@@ -1,3 +1,4 @@
+import json
 import unittest
 import sys
 import threading
@@ -239,6 +240,62 @@ class AtomicExecutorTests(unittest.TestCase):
             self.assertTrue((Path(directory) / "execution_graph.json").exists())
             self.assertTrue((Path(directory) / "execution_events.jsonl").exists())
             self.assertTrue((Path(directory) / "execution_summary.json").exists())
+
+    def test_final_snapshot_failure_is_recorded_without_stopping_successful_graph(self):
+        class SnapshotFailingAdapter(RecordingAdapter):
+            def __init__(self):
+                super().__init__()
+                self.snapshot_attempts = 0
+
+            def snapshot_all(self):
+                self.snapshot_attempts += 1
+                raise ValueError("read pos failed: comm_result=-3001, servo_error=0")
+
+        with TemporaryDirectory() as directory:
+            graph = compile_atomic_instruction("把物体A抓取放到目标A")
+            adapter = SnapshotFailingAdapter()
+            journal = ExecutionJournal(Path(directory))
+
+            result = AtomicGraphExecutor(adapter, scene_config(), journal).execute(graph)
+
+            summary = json.loads((Path(directory) / "execution_summary.json").read_text(encoding="utf-8"))
+            events = journal.read_events()
+
+        self.assertIs(result, graph)
+        self.assertEqual(graph.status, "succeeded")
+        self.assertTrue(all(node.status == "succeeded" for node in graph.nodes))
+        self.assertEqual(adapter.snapshot_attempts, 1)
+        self.assertEqual(sorted(adapter.calls), sorted(node.operation for node in graph.nodes))
+        self.assertNotIn("stop:left", adapter.calls)
+        self.assertEqual(summary["status"], "succeeded")
+        self.assertIn("warning", summary["final_state"])
+        self.assertEqual(
+            summary["final_state"]["snapshot_error"],
+            "ValueError: read pos failed: comm_result=-3001, servo_error=0",
+        )
+        failed_snapshot = next(event for event in events if event["event"] == "final_snapshot_failed")
+        self.assertEqual(failed_snapshot["snapshot_error"], summary["final_state"]["snapshot_error"])
+
+    def test_node_feedback_failure_still_stops_and_marks_graph_failed(self):
+        class FeedbackFailingAdapter(RecordingAdapter):
+            def execute_atomic(self, node, scene):
+                self.calls.append(node.operation)
+                if node.operation == "close_gripper":
+                    raise ValueError("communication failure: comm_result=-3001, servo_error=0")
+                return {"controller_idle": True}
+
+        with TemporaryDirectory() as directory:
+            graph = compile_atomic_instruction("把物体A抓取放到目标A")
+            adapter = FeedbackFailingAdapter()
+            journal = ExecutionJournal(Path(directory))
+
+            with self.assertRaisesRegex(ValueError, "communication failure"):
+                AtomicGraphExecutor(adapter, scene_config(), journal).execute(graph)
+
+        self.assertEqual(graph.status, "failed")
+        self.assertEqual(next(node for node in graph.nodes if node.status == "failed").operation, "close_gripper")
+        self.assertIn("stop:left", adapter.calls)
+        self.assertTrue(all(node.status != "pending" for node in graph.nodes))
 
     def test_failure_stops_arm_and_blocks_dependent_nodes(self):
         with TemporaryDirectory() as directory:

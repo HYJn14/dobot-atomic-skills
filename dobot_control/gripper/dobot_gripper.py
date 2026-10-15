@@ -89,7 +89,7 @@ class DobotGripper:
 
     def disconnect(self) -> None:
         """Closes the connection with the gripper."""
-        print("will release servo and port ")
+        print("Closing gripper serial port (no open command sent)")
         self._portHandler.closePort()
         self._portHandler = None
         self._packHandler = None
@@ -124,8 +124,17 @@ class DobotGripper:
     def get_current_position(self) -> int:
         """Returns the current position as returned by the physical hardware."""
         position, result, error = self.servo.ReadPos(self._servo_id)
-        if result != 0:
-            raise ValueError("read pos failed !!! ", error)
+        if result != COMM_SUCCESS or error != 0:
+            failure_types = []
+            if result != COMM_SUCCESS:
+                failure_types.append("communication failure")
+            if error != 0:
+                failure_types.append("servo/device error")
+            failures = " and ".join(failure_types)
+            raise ValueError(
+                f"ReadPos failed for servo ID {self._servo_id}: {failures} "
+                f"(comm_result={result}, servo_error={error})"
+            )
         localPos = int((position - self._min_servo_pos) / (self._max_servo_pos - self._min_servo_pos) * (
                 self._max_position - self._min_position))
         # print("read servo pos = ",position,"ret = ",localPos)
