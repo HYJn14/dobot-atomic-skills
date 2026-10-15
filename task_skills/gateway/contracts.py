@@ -14,6 +14,21 @@ DEVICES = {"dobot-nova-left": "left", "dobot-nova-right": "right"}
 OBJECTS = {"left": "A", "right": "B"}
 SKILLS = {"embodied.pick", "embodied.place"}
 
+# The registered chemistry atoms, published under the same RuntimeExecutionPackage
+# envelope as embodied.pick/place. The id is the chemistry skill id with a dobot.
+# prefix, so the mapping is mechanical and auditable; the parameters, defaults and
+# ranges are NOT restated here - they come from task_skills/chemistry/catalog.json
+# and are validated by task_skills.chemistry.registry, so there is exactly one
+# validator for them.
+CHEMISTRY_SKILL_PREFIX = "dobot."
+CHEMISTRY_UPSTREAM_SKILLS = {
+    "arm.move_joint", "arm.move_linear", "arm.move_to_home",
+    "gripper.set_position", "arm.rotate_about_pivot",
+}
+CHEMISTRY_SKILLS = {CHEMISTRY_SKILL_PREFIX + name: name for name in CHEMISTRY_UPSTREAM_SKILLS}
+EXECUTABLE_SKILLS = SKILLS | set(CHEMISTRY_SKILLS)
+FAMILIES = {"embodied", "chemistry"}
+
 
 class ContractError(Exception):
     def __init__(self, code, message, path="", status=422, details=None):
@@ -57,15 +72,89 @@ class Plan:
     dependencies: Dict[str, List[str]]
     arms: Dict[str, str]
     operations: Dict[str, List[AtomicNode]]
+    family: str = "embodied"
+
+
+def _chemistry_contract(profile=None, catalog=None):
+    """Publish the chemistry atoms as a second skill group in this catalogue.
+
+    The ids, parameters, defaults, ranges and pose whitelist are read from
+    ``task_skills/chemistry/`` instead of being restated here: one catalogue, one
+    validator. Imported lazily because the gateway must never pull in a module
+    that opens a device on import, and the chemistry package splits its pure
+    registry from its hardware driver for exactly that reason.
+    """
+    from ..chemistry.registry import load_catalog as load_chemistry_catalog
+    from ..chemistry.registry import load_profile as load_chemistry_profile
+
+    chemistry_catalog = load_chemistry_catalog() if catalog is None else catalog
+    chemistry_profile = load_chemistry_profile() if profile is None else profile
+    skills = []
+    for entry in chemistry_catalog.get("skills", []):
+        name = entry.get("id")
+        if name not in CHEMISTRY_UPSTREAM_SKILLS:
+            continue
+        contract = entry.get("contract", {})
+        aliases = entry.get("cn_aliases") or [name]
+        skills.append({
+            "skill_id": CHEMISTRY_SKILL_PREFIX + name, "version": entry.get("version", "1.0.0"),
+            "name_zh": aliases[0], "aliases_zh": list(aliases),
+            "lifecycle": "approved", "skill_kind": "atomic_action", "implements": [],
+            "method": {"family": "registered_atom", "mode": "calibrated_pose"},
+            "required_capabilities": ["arm_motion" if name.startswith("arm.") else "gripper_actuation"],
+            "required_sensors": ["controller_state", "tcp_pose", "joint_position", "gripper_position"],
+            "parameters": entry.get("parameters", {}),
+            "applicable_device_types": ["embodied_executor"],
+            "preconditions": list(contract.get("preconditions", [])),
+            "completion_conditions": [{"signal": "motion_sequence_completed", "operator": "eq", "value": True}],
+            "abort_conditions": [{"signal": "controller_alarm", "operator": "eq", "value": True}],
+            "execution_semantics": {"idempotent_start": True, "supports_pause": False,
+                                    "supports_cancel": True,
+                                    "maximum_retries": int(entry.get("retry_count", 0))},
+            "verification": {"level": "command_trace", "physical_success_verified": False},
+            "resources": list(entry.get("resources", [])),
+            "evidence": list(entry.get("evidence", [])),
+            "object_held_fact": bool(contract.get("object_held_fact", False)),
+            "warning": contract.get("warning"),
+        })
+    skills.sort(key=lambda item: item["skill_id"])
+    return {"profile": chemistry_profile, "catalog": chemistry_catalog,
+            "poses_digest": digest(chemistry_profile.get("poses", {})), "skills": skills}
 
 
 class Catalog:
-    def __init__(self, scene, mode="mock"):
+    def __init__(self, scene, mode="mock", chemistry=None):
         self.scene = scene
         self.mode = mode
+        self.chemistry = _chemistry_contract() if chemistry is None else chemistry
         self.revision = "dobot-" + digest({"scene": asdict(scene), "profile": "dobot-dag/1",
                                            "mode": mode, "skill_version": "1.0.0",
-                                           "cross_arm_motion_concurrency": 2})[:20]
+                                           "cross_arm_motion_concurrency": 2,
+                                           "chemistry_catalog": self.chemistry["catalog"],
+                                           "chemistry_poses": self.chemistry["poses_digest"]})[:20]
+
+    def _chemistry_operation(self, skill, arm, params, node_id, timeout, path):
+        """Normalize one dobot.* node through the chemistry registry.
+
+        The chemistry package owns the parameter contract (defaults, ranges and the
+        taught pose whitelist), so its ``normalize_parameters`` is the only place the
+        rules live. Its errors are mapped onto this envelope's error codes rather
+        than passed through raw.
+        """
+        from ..chemistry.registry import SkillValidationError, normalize_parameters
+
+        if not isinstance(params, dict):
+            raise ContractError("INVALID_GRAPH", "Expected a parameters object",
+                                path + ".skill_invocation.parameters")
+        name = CHEMISTRY_SKILLS[skill]
+        try:
+            normalized = normalize_parameters(name, arm, params, self.chemistry["profile"])
+        except SkillValidationError as error:
+            code = "DEVICE_PARAMETER_OUT_OF_RANGE" if " must be in " in str(error) else "INVALID_GRAPH"
+            raise ContractError(code, str(error), path + ".skill_invocation.parameters") from error
+        return AtomicNode(node_id + ":0", 0, "chemistry_atom", arm,
+                          parameters={"skill": name, "parameters": normalized},
+                          timeout_seconds=timeout)
 
     def snapshot(self):
         devices = []
@@ -73,7 +162,8 @@ class Catalog:
             devices.append({
                 "device_id": device, "name": "Dobot Nova " + arm, "device_type": "embodied_executor",
                 "manufacturer": "Dobot", "capability_version": "1.0.0",
-                "capabilities": ["pick", "place"], "supported_skill_ids": sorted(SKILLS),
+                "capabilities": ["pick", "place", "atomic_actions"],
+                "supported_skill_ids": sorted(EXECUTABLE_SKILLS),
                 "parameter_ranges": {}, "precision": {},
                 "completion_tolerances": {"tcp_position_mm": 1.0, "joint_angle_deg": 1.0},
                 "sensors": ["controller_state", "tcp_pose", "joint_position", "gripper_position"],
@@ -103,6 +193,7 @@ class Catalog:
                                         "supports_cancel": True, "maximum_retries": 0},
                 "verification": {"level": "command_trace", "physical_success_verified": False},
             })
+        skills.extend(self.chemistry["skills"])
         return {"schema_version": "1.0", "catalog_revision": self.revision,
                 "provider": "dobot-embodied-team", "devices": devices, "atomic_skills": skills,
                 "execution_profile": {"name": "dobot-dag/1", "schema_version": "2.1", "mode": self.mode,
@@ -134,6 +225,7 @@ class Catalog:
         if not isinstance(nodes, list) or not 1 <= len(nodes) <= 100 or not isinstance(edges, list) or len(edges) > 1000:
             raise ContractError("INVALID_GRAPH", "Expected 1..100 nodes and at most 1000 edges")
         ids, arms, operations, invocation_keys = {}, {}, {}, set()
+        families = set()
         for index, node in enumerate(nodes):
             path = "nodes[%d]" % index
             if not isinstance(node, dict):
@@ -175,8 +267,9 @@ class Catalog:
                 if not isinstance(call, dict):
                     raise ContractError("INVALID_GRAPH", "action requires skill_invocation", path)
                 skill = call.get("skill_id")
-                if skill not in SKILLS or call.get("skill_version") != "1.0.0":
-                    raise ContractError("UNSUPPORTED_SKILL", "Only registered pick/place 1.0.0 are executable", path)
+                if skill not in EXECUTABLE_SKILLS or call.get("skill_version") != "1.0.0":
+                    raise ContractError("UNSUPPORTED_SKILL",
+                                        "Executable 1.0.0 skills: " + ", ".join(sorted(EXECUTABLE_SKILLS)), path)
                 device = call.get("device_id")
                 if device not in DEVICES:
                     raise ContractError("DEVICE_INCOMPATIBLE", "Unknown registered device", path)
@@ -187,28 +280,38 @@ class Catalog:
                     raise ContractError("IDEMPOTENCY_CONFLICT", "Node invocation keys must be unique", path, 409)
                 invocation_keys.add(key)
                 params = call.get("parameters")
-                location_key = "source_ref" if skill.endswith("pick") else "destination_ref"
-                if not isinstance(params, dict) or set(params) != {"object_id", location_key}:
-                    raise ContractError("INVALID_GRAPH", "Expected object_id and " + location_key, path + ".skill_invocation.parameters")
-                obj = OBJECTS[arm]
-                if params["object_id"] != obj or params[location_key] not in {"object:" + obj, "target:target_" + obj}:
-                    raise ContractError("DEVICE_INCOMPATIBLE", "Object/location is not calibrated for this device", path)
-                ref = params[location_key]
-                if skill.endswith("pick"):
-                    specs = [("open_gripper", {}), ("move_pose", {"pose_ref": ref + ":transport", "motion": "linear"}),
-                             ("move_pose", {"pose_ref": ref, "motion": "linear"}), ("close_gripper", {}),
-                             ("move_pose", {"pose_ref": ref + ":transport", "motion": "linear"})]
+                if skill in CHEMISTRY_SKILLS:
+                    families.add("chemistry")
+                    operations[node_id] = [self._chemistry_operation(skill, arm, params, node_id, timeout, path)]
                 else:
-                    specs = [("move_pose", {"pose_ref": ref + ":transport", "motion": "linear"}),
-                             ("move_pose", {"pose_ref": ref, "motion": "linear"}), ("open_gripper", {}),
-                             ("move_pose", {"pose_ref": ref + ":transport", "motion": "linear"})]
-                operations[node_id] = [AtomicNode(node_id + ":" + str(i), i, op, arm, parameters=p, timeout_seconds=timeout)
-                                       for i, (op, p) in enumerate(specs)]
+                    families.add("embodied")
+                    location_key = "source_ref" if skill.endswith("pick") else "destination_ref"
+                    if not isinstance(params, dict) or set(params) != {"object_id", location_key}:
+                        raise ContractError("INVALID_GRAPH", "Expected object_id and " + location_key, path + ".skill_invocation.parameters")
+                    obj = OBJECTS[arm]
+                    if params["object_id"] != obj or params[location_key] not in {"object:" + obj, "target:target_" + obj}:
+                        raise ContractError("DEVICE_INCOMPATIBLE", "Object/location is not calibrated for this device", path)
+                    ref = params[location_key]
+                    if skill.endswith("pick"):
+                        specs = [("open_gripper", {}), ("move_pose", {"pose_ref": ref + ":transport", "motion": "linear"}),
+                                 ("move_pose", {"pose_ref": ref, "motion": "linear"}), ("close_gripper", {}),
+                                 ("move_pose", {"pose_ref": ref + ":transport", "motion": "linear"})]
+                    else:
+                        specs = [("move_pose", {"pose_ref": ref + ":transport", "motion": "linear"}),
+                                 ("move_pose", {"pose_ref": ref, "motion": "linear"}), ("open_gripper", {}),
+                                 ("move_pose", {"pose_ref": ref + ":transport", "motion": "linear"})]
+                    operations[node_id] = [AtomicNode(node_id + ":" + str(i), i, op, arm, parameters=p, timeout_seconds=timeout)
+                                           for i, (op, p) in enumerate(specs)]
                 expected_condition = "motion_sequence_completed"
             else:
                 raise ContractError("UNSUPPORTED_NODE_TYPE", "Supported nodes are action and wait", path)
             if node.get("completion_condition", expected_condition) != expected_condition:
                 raise ContractError("UNSUPPORTED_CONDITION", "Completion condition is not supported", path)
+        if len(families) > 1:
+            raise ContractError("INVALID_GRAPH",
+                                "A package must stay inside one skill family: either embodied.pick/place "
+                                "or the dobot.* atomic skills, never both", "nodes")
+        family = "chemistry" if families == {"chemistry"} else "embodied"
         dependencies = {node_id: [] for node_id in ids}
         for index, edge in enumerate(edges):
             path = "edges[%d]" % index
@@ -246,25 +349,29 @@ class Catalog:
                 if arms[first] != "system" and arms[first] == arms[second] and first not in ancestors[second]:
                     raise ContractError("RESOURCE_CONFLICT", "Same-device actions need explicit dependency order", "edges", 409,
                                         {"nodes": [first, second]})
-        # Validate the whole registered object's logical lifecycle, not just parameter shapes.
-        state = initial_state or {"left": {"held": False, "location": "object:A"},
-                                  "right": {"held": False, "location": "object:B"}}
-        held = {arm: item["held"] for arm, item in state.items()}
-        locations = {arm: item["location"] for arm, item in state.items()}
-        for node_id in order:
-            node = ids[node_id]
-            if node["node_type"] != "action":
-                continue
-            arm, call = arms[node_id], node["skill_invocation"]
-            if call["skill_id"].endswith("pick"):
-                if check_state and (held[arm] or call["parameters"]["source_ref"] != locations[arm]):
-                    raise ContractError("INVALID_OBJECT_STATE", "Pick requires an unheld object at the registered source", "nodes")
-                held[arm] = True
-            else:
-                if check_state and not held[arm]:
-                    raise ContractError("INVALID_OBJECT_STATE", "Place requires a preceding successful pick", "nodes")
-                held[arm] = False
-                locations[arm] = call["parameters"]["destination_ref"]
-        if check_state and any(held.values()):
-            raise ContractError("INVALID_OBJECT_STATE", "This fresh-run profile must end with objects released", "nodes")
-        return Plan(package, graph_id, digest(package), order, dependencies, arms, operations)
+        # Validate the whole registered object's logical lifecycle, not just parameter
+        # shapes. The dobot.* atoms move a tool, not a registered scene object, so the
+        # held/location model does not describe them; they are skipped rather than
+        # forced into it.
+        if family == "embodied":
+            state = initial_state or {"left": {"held": False, "location": "object:A"},
+                                      "right": {"held": False, "location": "object:B"}}
+            held = {arm: item["held"] for arm, item in state.items()}
+            locations = {arm: item["location"] for arm, item in state.items()}
+            for node_id in order:
+                node = ids[node_id]
+                if node["node_type"] != "action":
+                    continue
+                arm, call = arms[node_id], node["skill_invocation"]
+                if call["skill_id"].endswith("pick"):
+                    if check_state and (held[arm] or call["parameters"]["source_ref"] != locations[arm]):
+                        raise ContractError("INVALID_OBJECT_STATE", "Pick requires an unheld object at the registered source", "nodes")
+                    held[arm] = True
+                else:
+                    if check_state and not held[arm]:
+                        raise ContractError("INVALID_OBJECT_STATE", "Place requires a preceding successful pick", "nodes")
+                    held[arm] = False
+                    locations[arm] = call["parameters"]["destination_ref"]
+            if check_state and any(held.values()):
+                raise ContractError("INVALID_OBJECT_STATE", "This fresh-run profile must end with objects released", "nodes")
+        return Plan(package, graph_id, digest(package), order, dependencies, arms, operations, family)

@@ -15,6 +15,24 @@ from .store import Store, TERMINAL
 from .upstream import DeliveryWorker
 
 
+ENVELOPE_KEYS = {"graph", "package", "request_id"}
+
+
+def bare_package(body):
+    """Return ``body`` itself when the body *is* an execution package.
+
+    The counterparty serializes the graph document and posts that document. Both
+    shapes are therefore accepted: the ``{"graph": ...}`` envelope this gateway
+    documents, and the package as the whole body. A body carrying both envelope
+    and package keys is ambiguous and stays rejected.
+    """
+    if not isinstance(body, dict) or not ENVELOPE_KEYS.isdisjoint(body):
+        return None
+    if "nodes" in body and ("schema_version" in body or "package_id" in body):
+        return body
+    return None
+
+
 class Gateway:
     def __init__(self, scene, directory, mode="mock", allow_live=False, upstream=None,
                  adapter_factory=None, lease_path=None, reservation_seconds=60):
@@ -50,6 +68,10 @@ class Gateway:
     def _plan(self, body):
         if not isinstance(body, dict):
             raise ContractError("INVALID_REQUEST", "Request must be a JSON object", status=400)
+        if bare_package(body) is not None:
+            # Posted as the graph document itself; wrap it here so the rest of the
+            # pipeline only ever sees one shape.
+            body = {"package": body}
         if body.get("resume_from_node_id") is not None or body.get("execution_id") is not None:
             raise ContractError("UNSUPPORTED_RESUME", "This profile accepts fresh graphs only")
         if "mode" in body:
@@ -94,7 +116,19 @@ class Gateway:
             self.reservation_token = None
             self._release_lease()
 
-    def _acquire_lease(self):
+    def _acquire_lease(self, family="embodied"):
+        if family == "chemistry":
+            # The dobot.* atoms run through the chemistry driver, which takes the
+            # same rig lease (same DOBOT_DEVICE_LOCK_PATH) in the session its first
+            # atom opens. Taking the lease here as well would make every chemistry
+            # execution collide with itself. Ownership is still exclusive; it just
+            # belongs to the driver for this execution. A legacy CLI or ZMQ process
+            # holding the directory is reported here, before anything runs.
+            # Mock stays filesystem-independent: a stale live lease must not decide
+            # whether a simulated run is allowed.
+            if self.mode == "live" and DeviceLease(self.lease_path).path.exists():
+                raise ContractError("RESOURCE_CONFLICT", "Legacy control or quarantine owns the rig", status=409)
+            return
         if self.mode == "live" and self.lease is None:
             lease = DeviceLease(self.lease_path)
             try:
@@ -142,7 +176,7 @@ class Gateway:
             if not reserve:
                 return {"accepted": True, "validation_token": None, "catalog_revision": self.catalog.revision,
                         "reservations": [], "diagnostics": [], "package": plan.package}
-            self._acquire_lease()
+            self._acquire_lease(plan.family)
             token = "validation-" + uuid4().hex
             expiry = time.time() + self.reservation_seconds
             response = {"accepted": True, "validation_token": token, "catalog_revision": self.catalog.revision,
@@ -183,7 +217,7 @@ class Gateway:
             elif self.reservation_token:
                 raise ContractError("RESOURCE_CONFLICT", "Use the two-phase route for the reserved package", status=409)
             plan = self.catalog.validate(plan.package, self.store.object_state())
-            self._acquire_lease()
+            self._acquire_lease(plan.family)
             try:
                 record = self.store.create(key, plan, token if two_phase else None)
             except Exception:
@@ -201,7 +235,9 @@ class Gateway:
         """Submit a fresh execution of a direct package with server-generated keys."""
         if not isinstance(body, dict):
             raise ContractError("INVALID_REQUEST", "Request must be a JSON object", status=400)
-        if set(body) - {"graph", "package", "request_id"}:
+        if bare_package(body) is not None:
+            return self.submit_new_execution({"package": body})
+        if set(body) - ENVELOPE_KEYS:
             raise ContractError("INVALID_REQUEST", "Repeat accepts only graph/package and optional request_id", status=400)
         if "graph" in body and "package" in body:
             raise ContractError("INVALID_REQUEST", "Supply graph or package, not both", status=400)
@@ -239,6 +275,10 @@ class Gateway:
                 adapter = self.adapter_factory(cancel)
             elif self.mode == "mock":
                 adapter = MockAdapter(cancel)
+            elif plan.family == "chemistry":
+                from .chemistry import ChemistryAdapter
+
+                adapter = ChemistryAdapter(cancel)
             else:
                 from ..dobot_adapter import DobotHardwareAdapter
                 adapter = DobotHardwareAdapter.from_live(("left", "right"))

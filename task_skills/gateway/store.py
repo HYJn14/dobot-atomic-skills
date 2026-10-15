@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..graph import utc_now
-from .contracts import ContractError, DEVICES, canonical
+from .contracts import ContractError, DEVICES, SKILLS, canonical
 
 
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
@@ -215,7 +215,11 @@ class Store:
                 if node["node_type"] == "action":
                     call = node["skill_invocation"]
                     body.update({k: call[k] for k in ("device_id", "skill_id", "skill_version")})
-                    if node_status == "succeeded":
+                    # Only the embodied family carries the registered object model. The
+                    # dobot.* atoms move a tool to a taught pose and have no
+                    # destination_ref, so applying held/location bookkeeping to them
+                    # would both raise and invent state that no sensor confirmed.
+                    if node_status == "succeeded" and call["skill_id"] in SKILLS:
                         state = self.object_state()
                         arm = DEVICES[call["device_id"]]
                         if call["skill_id"] == "embodied.pick":

@@ -49,6 +49,8 @@ def run_graph(plan, adapter, scene, directory, cancel, emit, live=False):
     completed, futures, active_arms = set(), {}, set()
     first_error = None
     stop_result = None
+    preflight_evidence = None
+    family = getattr(plan, "family", "embodied")
     nodes = {n["node_id"]: n for n in plan.package["nodes"]}
 
     def execute_skill(node_id):
@@ -93,7 +95,7 @@ def run_graph(plan, adapter, scene, directory, cancel, emit, live=False):
                 stop_result = {"confirmed": False, "error": type(error).__name__}
 
     try:
-        if live:
+        if live and family == "embodied":
             from .dobot_adapter import DobotHardwareAdapter
             from .layout import physical_nova_home_degrees
 
@@ -106,6 +108,15 @@ def run_graph(plan, adapter, scene, directory, cancel, emit, live=False):
                 if len(measured) != 6 or not DobotHardwareAdapter._target_matches(measured, physical_nova_home_degrees(arm), 0):
                     raise RuntimeError("Both arms must start at their calibrated home pose")
                 adapter.configure_robot(arm, 20)
+        elif live:
+            # The dobot.* atoms carry their own session and their own start-state
+            # rules, so the gate is the chemistry driver's read-only preflight of
+            # the whole package rather than the embodied family's home check.
+            preflight_evidence = adapter.preflight(plan)
+            if preflight_evidence.get("success") is not True:
+                raise RuntimeError("Chemistry preflight failed: %s"
+                                   % (preflight_evidence.get("error")
+                                      or preflight_evidence.get("note") or "unknown reason"))
         emit("execution_started", status="running")
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="dobot-skill") as pool:
             while len(completed) < len(plan.order):
@@ -265,7 +276,8 @@ def run_graph(plan, adapter, scene, directory, cancel, emit, live=False):
                     "error": {"code": "EXECUTION_CANCELLED", "retryable": False, "phase": "final_home"},
                     "stop": stop_result,
                     "verification": {"level": "command_trace", "physical_success_verified": False}}
-        return {"status": "succeeded", "feedback": feedback,
+        return {"status": "succeeded", "feedback": feedback, "family": family,
+                "preflight": preflight_evidence,
                 "verification": {"level": "command_trace", "physical_success_verified": False},
                 "hardware_connected": live}
     except Exception as error:
@@ -273,5 +285,6 @@ def run_graph(plan, adapter, scene, directory, cancel, emit, live=False):
         request_stop()
         interrupted = isinstance(error, InterruptedError)
         return {"status": "cancelled" if interrupted else "failed",
-                "error": {"code": "EXECUTION_CANCELLED" if interrupted else "MOTION_TIMEOUT" if isinstance(error, TimeoutError) else "EXECUTION_FAILED", "retryable": False},
+                "error": {"code": "EXECUTION_CANCELLED" if interrupted else "MOTION_TIMEOUT" if isinstance(error, TimeoutError) else "EXECUTION_FAILED",
+                          "retryable": False, "message": str(error)},
                 "stop": stop_result, "exception_type": type(error).__name__}

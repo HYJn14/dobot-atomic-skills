@@ -1,6 +1,6 @@
 # Dobot 外部原子技能执行网关
 
-正式接入与联调文档：[手册 v1.1（PDF）](Dobot_原子技能执行接口与联调手册_v1.1.pdf)；[完整正文](Dobot_原子技能执行接口与联调手册_v1.1.md)。
+正式接入与联调文档：[手册 v1.1（PDF）](Dobot_原子技能执行接口与联调手册_v1.1.pdf)；[完整正文](Dobot_原子技能执行接口与联调手册_v1.1.md)。手册 v1.1 只覆盖 `embodied.*`；`dobot.*` 化学原子技能组以本文件与 `GET /v1/catalog` 为准，待手册下次修订并入。
 
 现在链路为：**上游生成执行图 → 本项目接收/拉取图 → 校验与资源占用 → 执行已注册技能 → 状态查询与事件回传**。新入口不调用自然语言解析器。旧 `run_task` 保留为现场人工入口，与网关共享设备所有权锁。
 
@@ -42,7 +42,7 @@ python -B -m task_skills.gateway.operator --mode mock --data-dir ./gateway-data/
 |---|---|
 | `GET /health` | 模式、目录版本、执行占用及隔离状态 |
 | `GET /v1/catalog`（别名 `/v1/capabilities`） | 本机设备、技能、固定物体/位置绑定和执行子集 |
-| `POST /v1/execute-graph` | `{"graph": RuntimeExecutionPackage}`，每个接收请求创建新执行；202 返回 `execution_id/status/graph_id/accepted_at` |
+| `POST /v1/execute-graph` | 请求体可以直接是 `RuntimeExecutionPackage` 本身，也可以包在 `{"graph": ...}` 里（**不需要任何幂等键**）；每个接收请求创建新执行；202 返回 `execution_id/status/graph_id/accepted_at` |
 | `POST /v1/execute-graph/idempotent` | 幂等单次提交；使用 `Idempotency-Key` 或 `request_id` 去重 |
 | `POST /device-gateway/v1/execution-plans/validate` | `{"package": RuntimeExecutionPackage,"reserve_resources":true}`，返回绑定包的 `validation_token`；默认预留 60 秒 |
 | `POST /device-gateway/v1/executions` | `{"package": RuntimeExecutionPackage,"validation_token":"..."}`，正式执行 |
@@ -53,9 +53,9 @@ python -B -m task_skills.gateway.operator --mode mock --data-dir ./gateway-data/
 
 查询/事件/取消也支持 `/device-gateway/v1/executions/{id}` 前缀。JSON 请求必须 `Content-Type: application/json`，不支持 chunked，最大 2 MiB。`/v1/execute-graph/idempotent`、两阶段预检和正式提交必须带 `Idempotency-Key`，或请求体 `request_id`；两者都有时必须相同。同一请求键+同一原始包返回原会话，不重复动作；换包报 409。每个动作还必须带唯一 `skill_invocation.idempotency_key`，已使用的节点键不能交给另一个会话。
 
-`POST /v1/execute-graph` 每次接收有效请求都创建新执行，不需要 `Idempotency-Key`。它只接受直接传入的完整 `graph` 或 `package`（两者只能有一个），不使用上游 `run_id` 拉图，也不接受预检 token、恢复或模式字段。若提供 `request_id`，必须是有效 ID，但不会用于去重。网关在包的深拷贝上生成唯一 dispatch key 和每个动作新的 `skill_invocation.idempotency_key`，同时保留 `package_id`、包内 `run_id` 和 `node_id`。因此自动重试或重复点击会创建另一份执行；依然受执行占用、预留、隔离、场景/物体状态及设备锁检查约束，不会取消当前任务或复位场景。需要网络重试保持幂等的自动化客户端应使用 `/v1/execute-graph/idempotent`；两阶段接口行为不变。
+`POST /v1/execute-graph` 每次接收有效请求都创建新执行，不需要 `Idempotency-Key`。它接受三种等价写法：请求体就是运行包本身（联调最省事，直接 POST 序列化好的图），或包在 `{"graph": ...}`、`{"package": ...}` 里（后两者只能有一个，混用返回 400）；不使用上游 `run_id` 拉图，也不接受预检 token、恢复或模式字段。若提供 `request_id`，必须是有效 ID，但不会用于去重。网关在包的深拷贝上生成唯一 dispatch key 和每个动作新的 `skill_invocation.idempotency_key`，同时保留 `package_id`、包内 `run_id` 和 `node_id`。因此自动重试或重复点击会创建另一份执行；依然受执行占用、预留、隔离、场景/物体状态及设备锁检查约束，不会取消当前任务或复位场景。需要网络重试保持幂等的自动化客户端应使用 `/v1/execute-graph/idempotent`；两阶段接口行为不变。
 
-live 图执行完成后，网关为每个参与臂发送 `arm_finalizing` 和 `arm_finalized` 事件；归位失败或取消时发送 `arm_finalization_failed` 或 `arm_finalization_cancelled`。臂标识位于事件的 `payload.arm`，归位状态和反馈也在 payload 中。这些执行级事件不对应图节点，不包含 `node_id`。
+live 图执行完成后，网关为每个参与臂发送 `arm_finalizing` 和 `arm_finalized` 事件；归位失败或取消时发送 `arm_finalization_failed` 或 `arm_finalization_cancelled`。臂标识位于事件的 `payload.arm`，归位状态和反馈也在 payload 中。这些执行级事件不对应图节点，不包含 `node_id`。收尾归位在动之前先做一次只读探测：关节已在标定 home 容差内且 `RobotMode` 为 5 的臂记为 `skipped`、不发任何指令（图里已自行归位的包因此不会多动一次），只有确实不在 home 的臂才进入完整会话。live 网关把带令牌的 POST 本身视为现场授权，收尾归位不再依赖交互式确认；此前这条缺失会让一个全部成功的包在收尾报 `FINAL_HOME_FAILED`，并把 rig 置为隔离。
 
 ## 当前可执行的图
 
@@ -64,7 +64,7 @@ live 图执行完成后，网关为每个参与臂发送 `arm_finalizing` 和 `a
 | 项目 | 当前合同 |
 |---|---|
 | 节点 | `action`、`wait`；初始 `status=pending`；1–100 个节点 |
-| 技能 | `embodied.pick@1.0.0`、`embodied.place@1.0.0` |
+| 技能 | 一个包只用一族：`embodied.pick@1.0.0`/`embodied.place@1.0.0`，或 `dobot.*@1.0.0` 化学原子组（见下）；混用返回 422 `INVALID_GRAPH` |
 | 设备 | `dobot-nova-left` → A，`dobot-nova-right` → B |
 | 参数 | pick: `object_id/source_ref`；place: `object_id/destination_ref`，不接受额外动作参数 |
 | 位置 | A: `object:A`、`target:target_A`；B: `object:B`、`target:target_B`，由本机示教场景解析，无任意坐标 |
@@ -78,6 +78,40 @@ live 图执行完成后，网关为每个参与臂发送 `arm_finalizing` 和 `a
 拒绝环、未知技能、未知条件、额外 preconditions/abort_conditions、非 success 边、`condition/observe/parallel/human_approval/recovery` 节点及断点续跑。并行通过多入口 DAG 表达。拒绝不能实现的安全条件，而不是忽略它。目录修订值不作为运行包兼容性门槛；场景 stamp 的内部复位检查仍独立生效。所有图必须让已抓取物体最终释放；执行成功后保存命令层逻辑位置，现场传感器尚不能独立验证物体是否实际到位。
 
 失败后的恢复、重新感知和派生图由上游决策。当前 fresh-run 子集不提供恢复节点/断点动作；真机失败后需现场复位再执行新图。双方仍须确认正式 JSON Schema、完整 typed-edge/wait/条件结构、取消合同及事件 ACK。
+
+### 化学原子技能组 `dobot.*`
+
+第二个技能族，与 `embodied.*` **共用同一信封**（`schema_version=2.1` / `graph_version=0.1`）、同一批路由、同一套事件与幂等规则；不新增第二个 HTTP 入口。技能 ID 是化学原子 ID 加 `dobot.` 前缀，同一份 `GET /v1/catalog` 的 `atomic_skills` 里发布。
+
+| 技能 ID（`1.0.0`） | 最小动作 | 参数 |
+|---|---|---|
+| `dobot.arm.move_joint` | 关节运动到一个教示位姿 | `target_ref`（必填）、可选 `source_ref`、`speed`（默认 20，1–100）、`grip_requirement`（`any`/`open`/`clamped`）、`tilt_limit_deg`（0–10） |
+| `dobot.arm.move_linear` | 从教示起点直线到教示终点 | `source_ref`、`target_ref` 均必填，其余同上 |
+| `dobot.arm.move_to_home` | 回到本机标定初始关节位姿 | 可选 `source_ref`、`speed`（默认 20）；**不接受目标位姿参数**，home 只有一个来源 |
+| `dobot.gripper.set_position` | 夹爪一次开度动作 | `position`（必填，0–255）、`speed`（默认 10）、`allow_release`（默认 `false`）、可选 `at_ref` |
+| `dobot.arm.rotate_about_pivot` | 绕杯心一次连续倾转 | `source_ref` 必须为 `right.beaker.work`、`tilt_deg`（默认 80，(0,90]）、`offset_mm`（3 个数，缺省取 `profile.pour.offset_mm`）、`segments`（默认 16，2–128）、`speed`（默认 15）、`cp`（默认 100） |
+
+| 项目 | 化学族的合同 |
+|---|---|
+| 设备 | `dobot-nova-left`/`dobot-nova-right`，与 `embodied.*` 相同；`idempotency_key` 仍全局唯一 |
+| 位姿引用 | 只接受 `profile.json` 里属于该臂的教示位姿；未知位姿、别的手臂的位姿、白名单外的技能名都返回 422 |
+| 参数校验 | 由 `task_skills.chemistry.registry.normalize_parameters` 单独校验（网关不重写默认值/范围），缺省值按上表补齐后原样落到节点 |
+| 等待 | `control.hold` **不是技能**：用信封自带的 `wait` 节点（`duration_s` 0–60，且 ≤ `timeout_s`）表达停留与错峰 |
+| 对象状态 | `dobot.*` 移动的是工具而不是场景对象，因此**不参与** `embodied.pick/place` 的 `held`/`location` 状态机，`modeled_object_state` 保持 A/B 原位 |
+| 完成条件 | action: `motion_sequence_completed`；wait: `wait_elapsed`，可省略使用默认 |
+| live 开始闸门 | **不是**"两臂必须已在示教 home"。化学驱动持自己的会话（设备租约 → `ClearError` → `EnableRobot` → 速度 → `Tool0`/`User0`），live 前逐节点按拓扑序对"从一次真机读数推演出的逐臂状态"做只读预检，预检失败即拒绝整包；跑完仍由网关为每个参与臂发 `arm_finalizing`/`arm_finalized` 并发归位 |
+| 独占 | 化学包由化学 `LiveDriver` **独占**机械臂会话，网关只转发、不另开连接；同一 `DOBOT_DEVICE_LOCK_PATH` 的旧 CLI/ZMQ 进程必须先停 |
+
+可提交示例：[examples/runtime-chemistry-beaker-pour.json](examples/runtime-chemistry-beaker-pour.json)（20 节点 / 24 边的双臂"右臂烧杯倒进左臂离心管"，含去程 8 s、回程 5 s 两次错峰与两臂同时复位）。它由 `examples/chemistry/right_beaker_pour_into_left_tube.json` 经 `task_skills.gateway.chemistry.to_runtime_package` 机械生成，测试逐字节钉住两者一致——对手工改过的 JSON，校验器可能接受但会与库的行为脱节，因此请以生成路径为准。
+
+mock 联调：
+
+```powershell
+python -B -m task_skills.run_gateway --mode mock --port 8080 --data-dir ./gateway-data/mock-chem
+python -B -m task_skills.gateway.demo_client --package docs/execution-api/examples/runtime-chemistry-beaker-pour.json
+```
+
+真机：先按下一节做现场复位，再 `--mode live --allow-live` 起同一网关；化学包在该模式下不再要求"两臂在示教 home"，但仍要求现场无旧控制进程持锁。
 
 ## 接上游服务
 
@@ -105,7 +139,7 @@ $env:DOBOT_GATEWAY_TOKEN = '<现场注入令牌>'
 python -B -m task_skills.run_gateway --mode live --allow-live --data-dir ./gateway-data/live
 ```
 
-所有代码副本与旧控制入口必须使用同一 `DOBOT_DEVICE_LOCK_PATH`；未升级的旧进程不能被此协作锁约束。网关会检查 controller 模式/home，将速度倍率、关节/直线速度及加速度参数设为 20%；成功结束时所有参与臂并行归 home，并等待全部归位完成后才报告成功。不会自动清报警、使能或在启动时移动机械臂。内部场景 stamp 绑定唯一 registry、复位 epoch 与场景修订，另一个数据目录的复位会使旧目录失效；数据库固定 mock/live 模式，不能混用。
+所有代码副本与旧控制入口必须使用同一 `DOBOT_DEVICE_LOCK_PATH`；未升级的旧进程不能被此协作锁约束。网关会检查 controller 模式/home，将速度倍率、关节/直线速度及加速度参数设为 20%；成功结束时所有参与臂并行归 home，并等待全部归位完成后才报告成功；已在标定 home 的臂会被跳过（`skipped`，不发指令），不会为了凑动作再发一次关节移动。不会自动清报警、使能或在启动时移动机械臂。内部场景 stamp 绑定唯一 registry、复位 epoch 与场景修订，另一个数据目录的复位会使旧目录失效；数据库固定 mock/live 模式，不能混用。
 
 取消/失败停止双臂、夹爪原位 hold 并检查稳定反馈；停止后命令 gate 禁止追加动作，全部执行线程退出后再次验证停止。停止未确认或真机执行未完整结束会隔离 rig，不再接新执行。ZMQ 老入口退出没有可靠停止验证，因此保留 owner 锁。不要自动回原点、松爪或清除这个锁。
 
@@ -117,8 +151,9 @@ python -B -m task_skills.run_gateway --mode live --allow-live --data-dir ./gatew
 
 ```powershell
 python -B -m unittest discover -s tests -p test_execution_gateway.py -v
+python -B -m unittest discover -s tests -p test_chemistry_skills.py -q
 python -B -m unittest discover -s tests -p test_atomic_runner_unittest.py -q
 python -B -m unittest discover -s tests -p test_teleop_regressions.py -q
 ```
 
-覆盖真实 loopback HTTP、模拟上游目录/拉图/事件回传、幂等并发、两阶段 token、取消/超时/失败、重启、逻辑物体状态、协作锁、模式隔离及场景 stamp。真机部署和物理成功仍需现场联调。
+覆盖真实 loopback HTTP、模拟上游目录/拉图/事件回传、幂等并发、两阶段 token、取消/超时/失败、重启、逻辑物体状态、协作锁、模式隔离、场景 stamp，以及 `dobot.*` 技能族的目录发布、族隔离（混用 422）、位姿白名单、参数缺省补齐、live 化学前置闸门与 20 节点图 mock 端到端。真机部署和物理成功仍需现场联调。

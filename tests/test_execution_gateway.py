@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.client import BadStatusLine, IncompleteRead
@@ -16,7 +17,8 @@ from urllib.request import Request, urlopen
 from task_skills.device_lease import DeviceLease
 from task_skills.dobot_adapter import DobotHardwareAdapter
 from task_skills.atomic_graph import AtomicNode
-from task_skills.gateway.contracts import Catalog, ContractError, digest
+from task_skills.gateway.contracts import (CHEMISTRY_SKILLS, Catalog, ContractError,
+                                            digest)
 from task_skills.gateway.server import GatewayServer
 from task_skills.gateway.service import Gateway
 from task_skills.gateway.store import Store
@@ -53,6 +55,15 @@ def package(revision=None, suffix="1", hold=0):
     if revision is not None:
         result["catalog_revision"] = revision
     return result
+
+
+CHEMISTRY_DAG = Path(__file__).resolve().parents[1] / "examples/chemistry/right_beaker_pour_into_left_tube.json"
+CHEMISTRY_PACKAGE = Path(__file__).resolve().parents[1] / "docs/execution-api/examples/runtime-chemistry-beaker-pour.json"
+
+
+def chemistry_package():
+    with open(CHEMISTRY_PACKAGE, encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def wait_package(suffix, revision=None):
@@ -1139,6 +1150,286 @@ class RegistryAndDriverTests(unittest.TestCase):
         with TemporaryDirectory() as temp:
             with self.assertRaises(ValueError):
                 Gateway(load_scene_config(SCENE), temp, mode="live")
+
+
+class ChemistryGatewayTests(unittest.TestCase):
+    """The dobot.* atom group rides the embodied envelope; these pin that seam."""
+
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.gateway = Gateway(load_scene_config(SCENE), Path(self.temp.name) / "data")
+        self.server = GatewayServer(("127.0.0.1", 0), self.gateway, token="test-token")
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02})
+        self.thread.start()
+        self.url = "http://127.0.0.1:" + str(self.server.server_port)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.gateway.close()
+        self.temp.cleanup()
+
+    def request(self, path, body=None, key=None):
+        headers = {"Authorization": "Bearer test-token"}
+        if key:
+            headers["Idempotency-Key"] = key
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode()
+        try:
+            response = urlopen(Request(self.url + path, data=data, headers=headers), timeout=10)
+        except HTTPError as error:
+            response = error
+        with response:
+            return response.code, json.loads(response.read())
+
+    def finish(self, execution_id):
+        # The 20-node graph really sleeps through its 8 s and 5 s stagger waits.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            result = self.gateway.status(execution_id)
+            if result["status"] in {"succeeded", "failed", "cancelled", "interrupted"}:
+                return result
+            time.sleep(0.01)
+        self.fail("Execution did not terminate")
+
+    def test_shipped_chemistry_example_is_the_bridge_output(self):
+        from task_skills.gateway.chemistry import to_runtime_package
+
+        shipped = chemistry_package()
+        with open(CHEMISTRY_DAG, encoding="utf-8") as handle:
+            authored = json.load(handle)
+        rebuilt = to_runtime_package(authored, run_id=shipped["run_id"],
+                                     catalog_revision=shipped["catalog_revision"])
+        self.assertEqual(rebuilt, shipped, "The delivered JSON must be the bridge's own output")
+        self.assertEqual(len(shipped["nodes"]), 20)
+        self.assertEqual(len(shipped["edges"]), 24)
+        self.assertEqual(shipped["entry_node_ids"],
+                         ["left_tube_approach", "right_beaker_approach"])
+
+    def test_chemistry_package_validates_as_its_own_family(self):
+        plan = self.gateway.catalog.validate(chemistry_package())
+        self.assertEqual(plan.family, "chemistry")
+        self.assertEqual(len(plan.order), 20)
+        operation = plan.operations["left_tube_approach"][0]
+        self.assertEqual((operation.operation, operation.arm), ("chemistry_atom", "left"))
+        self.assertEqual(operation.parameters["skill"], "arm.move_joint")
+        self.assertEqual(operation.parameters["parameters"]["target_ref"], "left.tube.approach")
+        pour = plan.operations["pour_into_tube"][0]
+        self.assertEqual(pour.parameters["skill"], "arm.rotate_about_pivot")
+        self.assertEqual(pour.parameters["parameters"]["speed"], 15)
+        for node_id in ("work_stagger_8s", "return_stagger_5s"):
+            self.assertEqual(plan.operations[node_id][0].operation, "wait")
+            self.assertEqual(plan.arms[node_id], "system")
+
+    def test_chemistry_defaults_come_from_the_chemistry_catalog(self):
+        graph = chemistry_package()
+        node = next(item for item in graph["nodes"] if item["node_id"] == "left_tube_approach")
+        self.assertEqual(node["skill_invocation"]["parameters"], {"target_ref": "left.tube.approach",
+                                                                 "grip_requirement": "open",
+                                                                 "speed": 20, "tilt_limit_deg": 1})
+        node["skill_invocation"]["parameters"] = {"target_ref": "left.tube.approach"}
+        normalized = self.gateway.catalog.validate(graph).operations["left_tube_approach"][0]
+        self.assertEqual(normalized.parameters["parameters"],
+                         {"target_ref": "left.tube.approach", "speed": 20,
+                          "grip_requirement": "any", "tilt_limit_deg": 1})
+
+    def test_pose_reference_outside_the_chemistry_profile_is_rejected(self):
+        graph = chemistry_package()
+        next(item for item in graph["nodes"]
+             if item["node_id"] == "left_tube_approach")["skill_invocation"]["parameters"]["target_ref"] = "left.tube.nowhere"
+        with self.assertRaises(ContractError) as caught:
+            self.gateway.catalog.validate(graph)
+        self.assertEqual(caught.exception.status, 422)
+        self.assertIn("missing from profile.poses", caught.exception.body["message"])
+        code, body = self.request("/v1/execute-graph", {"graph": graph}, "chem-bad-pose")
+        self.assertEqual((code, body["code"]), (422, "INVALID_GRAPH"))
+
+    def test_unknown_dobot_skill_is_rejected(self):
+        graph = chemistry_package()
+        next(item for item in graph["nodes"]
+             if item["node_id"] == "pour_into_tube")["skill_invocation"]["skill_id"] = "dobot.arm.stir"
+        code, body = self.request("/v1/execute-graph", {"graph": graph}, "chem-bad-skill")
+        self.assertEqual((code, body["code"]), (422, "UNSUPPORTED_SKILL"))
+
+    def test_mixing_chemistry_and_embodied_nodes_is_rejected(self):
+        graph = chemistry_package()
+        graph["nodes"].append({
+            "node_id": "pick-B", "node_type": "action", "status": "pending", "timeout_s": 30,
+            "skill_invocation": {"skill_id": "embodied.pick", "skill_version": "1.0.0",
+                                 "device_id": "dobot-nova-right",
+                                 "parameters": {"object_id": "B", "source_ref": "object:B"},
+                                 "idempotency_key": "chem-mixed:pick-B"},
+            "on_fail": {"strategy": "decision_agent", "max_retries": 0, "allowed_actions": ["safe_stop"]}})
+        graph["edges"].append({"source": "right_arm_home", "target": "pick-B", "edge_type": "success"})
+        code, body = self.request("/v1/execute-graph", {"graph": graph}, "chem-mixed")
+        self.assertEqual((code, body["code"]), (422, "INVALID_GRAPH"))
+        self.assertIn("one skill family", body["message"])
+
+    def test_catalog_publishes_the_dobot_atom_group(self):
+        code, body = self.request("/v1/catalog")
+        self.assertEqual(code, 200)
+        published = {skill["skill_id"]: skill for skill in body["atomic_skills"]}
+        self.assertEqual(set(CHEMISTRY_SKILLS) - set(published), set())
+        self.assertEqual(published["dobot.arm.move_joint"]["parameters"]["speed"]["default"], 20)
+        self.assertEqual(published["dobot.gripper.set_position"]["parameters"]["speed"]["default"], 10)
+        self.assertEqual(published["dobot.arm.rotate_about_pivot"]["parameters"]["speed"]["default"], 15)
+        self.assertEqual(published["dobot.arm.rotate_about_pivot"]["parameters"]["source_ref"]["const"],
+                         "right.beaker.work")
+        self.assertFalse(published["dobot.gripper.set_position"]["verification"]["physical_success_verified"])
+        self.assertIn("dobot.arm.move_joint", body["devices"][0]["supported_skill_ids"])
+
+    def test_chemistry_package_executes_in_mock_mode_without_the_object_state_machine(self):
+        before = self.gateway.store.object_state()
+        code, body = self.request("/v1/execute-graph", {"graph": chemistry_package()}, "chem-e2e")
+        self.assertEqual(code, 202)
+        done = self.finish(body["execution_id"])
+        self.assertEqual(done["status"], "succeeded")
+        self.assertEqual(len(done["node_statuses"]), 20)
+        self.assertEqual(set(done["node_statuses"].values()), {"succeeded"})
+        self.assertEqual(self.gateway.store.object_state(), before,
+                         "dobot.* atoms move a tool, not registered objects A/B")
+        events = self.gateway.store.events(body["execution_id"])
+        completed = {event["node_id"] for event in events if event["event_type"] == "action_completed"}
+        self.assertEqual(completed, {"left_tube_approach", "right_beaker_approach", "left_tube_insert",
+                                     "right_beaker_insert", "left_tube_close", "right_beaker_close",
+                                     "right_beaker_to_work", "left_tube_to_work", "pour_into_tube",
+                                     "right_beaker_untip", "left_tube_return", "left_tube_release",
+                                     "left_tube_retreat", "right_beaker_return", "right_beaker_release",
+                                     "right_beaker_retreat", "left_arm_home", "right_arm_home"})
+
+    def test_the_package_itself_is_accepted_as_the_whole_body(self):
+        # The counterparty posts the serialized graph document, so the gateway must
+        # accept it unwrapped as well as under {"graph": ...}.
+        code, body = self.request("/v1/execute-graph", chemistry_package())
+        self.assertEqual(code, 202)
+        self.assertEqual(body["graph_id"], "runtime-right_beaker_pour_into_left_tube")
+        self.assertEqual(self.finish(body["execution_id"])["status"], "succeeded")
+
+    def test_unwrapped_body_still_needs_a_key_on_the_idempotent_route(self):
+        code, body = self.request("/v1/execute-graph/idempotent", chemistry_package())
+        self.assertEqual((code, body["code"], body["path"]), (422, "INVALID_GRAPH", "Idempotency-Key"))
+
+    def test_live_chemistry_start_gate_is_the_driver_preflight_not_the_home_pose(self):
+        catalog = Catalog(self.gateway.scene, "live")
+        plan = catalog.validate(chemistry_package())
+        calls = []
+
+        class FakeChemistryAdapter:
+            def preflight(self, package_plan):
+                calls.append("preflight")
+                return {"success": True, "note": "fake chemistry preflight"}
+
+            def snapshot_all(self):
+                calls.append("snapshot_all")
+                return {"hardware_connected": True, "mode": "chemistry"}
+
+            def configure_robot(self, arm, speed):
+                calls.append("configure_robot")
+
+            def execute_atomic(self, node, scene):
+                calls.append((node.arm, node.operation))
+                return {"fake": True}
+
+            def stop_and_verify(self):
+                return {"confirmed": True}
+
+            def close(self):
+                pass
+
+        with TemporaryDirectory() as temp:
+            result = run_graph(plan, FakeChemistryAdapter(), self.gateway.scene, temp,
+                               threading.Event(), lambda *args, **kwargs: None, live=True)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["family"], "chemistry")
+        self.assertEqual(result["preflight"], {"success": True, "note": "fake chemistry preflight"})
+        self.assertEqual(calls[0], "preflight")
+        self.assertNotIn("configure_robot", calls, "The embodied home gate must not run for chemistry")
+        atoms = [call for call in calls if isinstance(call, tuple)]
+        self.assertEqual(sorted(arm for arm, operation in atoms if operation == "move_safe_pose"),
+                         ["left", "right"], "A finished graph still parks both arms at home")
+
+    def test_chemistry_live_preflight_failure_stops_before_any_atom(self):
+        catalog = Catalog(self.gateway.scene, "live")
+        plan = catalog.validate(chemistry_package())
+        calls = []
+
+        class RefusingAdapter:
+            def preflight(self, package_plan):
+                calls.append("preflight")
+                return {"success": False, "error": "left.tube.work is not reachable from the current state"}
+
+            def snapshot_all(self):
+                return {}
+
+            def configure_robot(self, arm, speed):
+                calls.append("configure_robot")
+
+            def execute_atomic(self, node, scene):
+                calls.append(("atom", node.node_id))
+                return {}
+
+            def stop_and_verify(self):
+                return {"confirmed": True}
+
+            def close(self):
+                pass
+
+        with TemporaryDirectory() as temp:
+            result = run_graph(plan, RefusingAdapter(), self.gateway.scene, temp,
+                               threading.Event(), lambda *args, **kwargs: None, live=True)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("not reachable", result["error"]["message"])
+        self.assertEqual([call for call in calls if isinstance(call, tuple)], [])
+
+    def test_chemistry_adapter_preflight_skips_a_package_without_chemistry_atoms(self):
+        from task_skills.gateway.chemistry import ChemistryAdapter
+
+        plan = self.gateway.catalog.validate(package(self.gateway.catalog.revision))
+        evidence = ChemistryAdapter(threading.Event()).preflight(plan)
+        self.assertEqual(evidence, {"success": True, "note": "no chemistry atoms in this package"})
+
+    def test_the_gateway_answers_the_chemistry_drivers_consent_gate(self):
+        """A live POST is the on-site consent ``LiveDriver.home`` asks for.
+
+        Without it the final park of a finished chemistry run raised, which turned
+        a successful package into ``FINAL_HOME_FAILED`` and quarantined the rig.
+        """
+        from task_skills.gateway.chemistry import ChemistryAdapter
+
+        adapter = ChemistryAdapter(threading.Event())
+        self.assertTrue(adapter.driver().confirm(),
+                        "a live gateway run must not fail its final park for want of a prompt")
+
+        injected = ChemistryAdapter(threading.Event(), confirmation=lambda: False)
+        self.assertFalse(injected.driver().confirm(),
+                         "a confirmation injected by the caller still decides")
+
+    def test_the_gateways_final_park_does_not_raise_for_a_parked_arm(self):
+        """The exact call that failed on 2026-10-15 17:23 CST, minus the hardware.
+
+        The run had finished all twenty nodes and then the final park blew up in
+        ``LiveDriver.home``. Only the two hardware reads are replaced here; the
+        gateway's own path - adapter -> driver -> consent gate -> parked probe -
+        is the code that failed.
+        """
+        from task_skills.layout import physical_nova_home_degrees
+        from task_skills.gateway.chemistry import ChemistryAdapter
+
+        adapter = ChemistryAdapter(threading.Event())
+        driver = adapter.driver()
+        driver._rig = lambda arm, profile, with_motion=True: SimpleNamespace(arm=arm)
+        driver._read_state = lambda rig: {"source": "offline", "mode": 5,
+                                          "joints": list(physical_nova_home_degrees(rig.arm)),
+                                          "pose": [0.0] * 6}
+        evidence = adapter.execute_atomic(
+            AtomicNode("final:left", 0, "move_safe_pose", "left", timeout_seconds=180),
+            self.gateway.scene)
+        self.assertTrue(evidence["success"], evidence)
+        self.assertTrue(evidence["arms"]["left"]["skipped"], evidence)
+
 
 
 if __name__ == "__main__":
