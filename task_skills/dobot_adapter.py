@@ -291,7 +291,7 @@ class DobotHardwareAdapter:
                 try:
                     hold_target = self._gripper_position(arm)
                     with self._command_gates[arm]:
-                        self._require_success("gripper hold", gripper.move(hold_target, 30, 50))
+                        self._hold_gripper_for_stop(arm, gripper, hold_target)
                 except Exception as error:
                     errors.append("gripper_hold:" + type(error).__name__)
             stable_arm, stable_gripper = 0, 0
@@ -320,6 +320,9 @@ class DobotHardwareAdapter:
             arms = list(self.dashboards)
             results = dict(zip(arms, pool.map(confirm, arms)))
         return {"confirmed": bool(results) and all(r["stop_confirmed"] for r in results.values()), "arms": results}
+
+    def _hold_gripper_for_stop(self, arm, gripper, hold_target):
+        self._require_success("gripper hold", gripper.move(hold_target, 30, 50))
 
     @staticmethod
     def resolve_pose_ref(scene, reference: str, height: float = 50.0, arm: Optional[str] = None):
