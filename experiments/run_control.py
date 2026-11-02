@@ -21,10 +21,11 @@ from dobot_control.agents.dobot_agent import DobotAgent
 from dobot_control.cameras.realsense_camera import RealSenseCamera
 from dobot_control.cameras.settings import CAMERA_NAMES, load_camera_settings
 from dobot_control.async_writer import BoundedAsyncWriter
-from dobot_control.absolute_teleop import AbsoluteTeleopPlanner, CommandInterval
+from dobot_control.absolute_teleop import AbsoluteTeleopPlanner, CommandInterval, DEFAULT_FOLLOW_SPEED_RAD_S
 from dobot_control.teleop_safety import (
     MasterRunawayGuard,
     check_pose_protection,
+    is_within_workspace,
 )
 import datetime
 from pathlib import Path
@@ -82,22 +83,27 @@ class RecordingSample:
     images: tuple
     observations: dict
     action: np.ndarray
+    camera_names: tuple = CAMERA_NAMES
 
 
 def write_recording_sample(sample):
     episode_dir = Path(sample.episode_dir)
-    image_dirs = (
-        episode_dir / "topImg",
-        episode_dir / "leftImg",
-        episode_dir / "rightImg",
-    )
+    if len(sample.images) != len(sample.camera_names) or not sample.camera_names:
+        raise ValueError("Recording requires one image per enabled camera")
+    if (len(set(sample.camera_names)) != len(sample.camera_names)
+            or any(name not in CAMERA_NAMES for name in sample.camera_names)
+            or any(not jpeg for jpeg in sample.images)):
+        raise ValueError("Recording camera names and images must be valid")
+    image_dirs = tuple(episode_dir / f"{name}Img" for name in sample.camera_names)
     obs_dir = episode_dir / "observation"
     for folder in (*image_dirs, obs_dir):
         folder.mkdir(parents=True, exist_ok=True)
     for folder, jpeg_image in zip(image_dirs, sample.images):
         output_path = folder / f"{sample.index}.jpg"
         output_path.write_bytes(jpeg_image)
-    save_frame(str(obs_dir) + os.sep, sample.index, sample.observations, sample.action)
+    observations = dict(sample.observations)
+    observations["_teleop_camera_names"] = np.asarray(sample.camera_names)
+    save_frame(str(obs_dir) + os.sep, sample.index, observations, sample.action)
 
 
 def close_record_writer(record_writer):
@@ -177,25 +183,26 @@ def button_monitor_realtime(agent, stop_event, ready_event):
                         what_to_do[i, 1] = 0
                         runtime_log("BUTTON_A_LONG", hand=i, action="servo_off", state=what_to_do.copy())
 
-        # button B
-        # more than one start servo
+        # Either B button controls one shared recording session. A full press
+        # and release is required; a release from the initial baseline is not.
+        released = []
         for i in range(2):
             if dev_keys[i, 1] == -1:  # B button pressed
                 start_press_status[i, 1] = 1
-            if dev_keys[i, 1] == 1:
+            if dev_keys[i, 1] == 1 and start_press_status[i, 1]:
                 start_press_status[i, 1] = 0
-                if keys_press_count[0, 2] % 2 == 1:
-                    if keys_press_count[0, 1] % 2 == 1 or keys_press_count[1, 1] % 2 == 1:
-                        what_to_do[0, 2] = 1
-                        # log_write(__file__, "ButtonB: [" + str(i) + "] recording")
-                        # new recording
-                        now_time = datetime.datetime.now()
-                        dt_time[0] = int(now_time.strftime("%Y%m%d%H%M%S%f")[:-3])
-                        keys_press_count[0, 2] += 1
-                else:
-                    what_to_do[0, 2] = 0
-                    keys_press_count[0, 2] += 1
-                    # log_write(__file__, "ButtonB: [" + str(i) + "] stop recording")
+                released.append(i)
+        if released:
+            if what_to_do[0, 2]:
+                what_to_do[0, 2] = 0
+                runtime_log("BUTTON_B", hands=released, action="record_stop")
+            elif np.any(what_to_do[:, 1]):
+                now_id = int(datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3])
+                dt_time[0] = max(now_id, int(dt_time[0]) + 1)
+                what_to_do[0, 2] = 1
+                runtime_log("BUTTON_B", hands=released, action="record_start", episode=int(dt_time[0]))
+            else:
+                runtime_log("BUTTON_B", hands=released, action="record_ignored", reason="servo_off")
 
         # status fall
         if using_sensor_protection:
@@ -423,13 +430,12 @@ def validate_absolute_alignment(current, target, robot_type, flags, joint_step=0
         sample = current + delta * fraction
         positions, velocities = calculate_vel_pos(sample, sample, 1.0, robot_type)
         positions_mm = {key: value * 1000 for key, value in positions.items()}
-        for side, name, x_range in ((0,"left",(-450,300)), (1,"right",(-250,450))):
+        for side, name in enumerate(("left", "right")):
             if not flags[side]:
                 continue
             for tip in (f"{name}_left", f"{name}_right"):
                 p = positions_mm[tip]
-                if not (x_range[0] <= p[0] <= x_range[1]
-                        and -750 <= p[1] <= -160 and p[2] > 40):
+                if not is_within_workspace(p, name):
                     return False, {"sample":index, "samples":samples,
                                    "fraction":float(fraction), "nova_side":name,
                                    "tip":tip, "position_mm":p.tolist(),
@@ -531,8 +537,7 @@ def main(args):
     active_camera_indices = [CAMERA_NAMES.index(name) for name in camera_settings.serials]
     recording_enabled = camera_settings.recording_enabled
     print(f"camera thread init success: {list(camera_settings.serials)}, {camera_settings.fps} fps")
-    if not recording_enabled:
-        print("[RECORD] Three-view recording disabled; selected-camera teleoperation only.")
+    print(f"[RECORD] Enabled views: {list(camera_settings.serials)}; output: {save_dir}")
 
     # agent init
     hands_ini, hands_dict = load_ini_data_hands()
@@ -599,7 +604,7 @@ def main(args):
     # per loop. The loop is variable-rate because it includes network and
     # status RPCs; a fixed step therefore creates lag at low frequency.
     max_servoj_speed_rad_s = float(
-        os.environ.get("DOBOT_SERVOJ_MAX_SPEED_RAD_S", "4.0")
+        os.environ.get("DOBOT_SERVOJ_MAX_SPEED_RAD_S", str(DEFAULT_FOLLOW_SPEED_RAD_S))
     )
     max_servoj_step_rad = float(
         os.environ.get("DOBOT_SERVOJ_MAX_STEP_RAD", "0.35")
@@ -729,6 +734,7 @@ def main(args):
                     agent.set_torque(i, True)
                     runtime_log("SERVO_OFF", hand=i, state=what_to_do.copy())
             if what_to_do[0, 1] == 0 and what_to_do[1, 1] == 0:
+                what_to_do[:, 2] = 0
                 start_servo = False
                 planner.reset()
                 master_runaway_guard.clear()
@@ -851,8 +857,11 @@ def main(args):
                 idx = 0
                 record_source_index = 0
                 curr_light = set_light(env, "green", 1)
+                runtime_log("RECORD_START", episode_dir=os.path.join(save_dir, str(dt_time[0])),
+                            cameras=list(camera_settings.serials))
             elif dev_what_to_do[0, 2] == -1 and recording_enabled:
                 curr_light = set_light(env, "yellow", 1)
+                runtime_log("RECORD_STOP", samples=idx, dropped=record_writer.dropped_count)
 
             # Preserve the behavior-cloning pairing used by the original
             # collector: pre-command observation obs_t with action_t. The
@@ -877,9 +886,10 @@ def main(args):
                     return RecordingSample(
                         episode_dir=os.path.join(save_dir, str(dt_time[0])),
                         index=idx,
-                        images=tuple(jpeg_list),
+                        images=tuple(jpeg_list[i] for i in active_camera_indices),
                         observations=observations,
                         action=np.asarray(action).copy(),
+                        camera_names=tuple(camera_settings.serials),
                     )
 
                 try:

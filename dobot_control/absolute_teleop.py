@@ -1,9 +1,10 @@
 """Non-actuating absolute joint target planner, with per-arm slow alignment."""
 import numpy as np
 
+DEFAULT_FOLLOW_SPEED_RAD_S = 3.2
 
 class AbsoluteTeleopPlanner:
-    def __init__(self, align_speed=0.15, follow_speed=4.0, max_step=0.35,
+    def __init__(self, align_speed=0.15, follow_speed=DEFAULT_FOLLOW_SPEED_RAD_S, max_step=0.35,
                  tolerance=0.02, settle_samples=3, max_dt=0.05):
         values = (align_speed, follow_speed, max_step, tolerance, max_dt)
         if not all(np.isfinite(v) and v > 0 for v in values) or align_speed > follow_speed:

@@ -14,8 +14,8 @@ class CameraSettings:
 
     @property
     def recording_enabled(self):
-        # The dataset writer requires all three views. Never write fake views.
-        return set(self.serials) == set(CAMERA_NAMES)
+        # Save only configured views, including single-camera teleoperation.
+        return bool(self.serials)
 
 
 def load_camera_settings(path=DEFAULT_PATH):
