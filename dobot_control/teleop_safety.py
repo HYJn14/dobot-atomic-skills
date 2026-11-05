@@ -4,12 +4,13 @@ from typing import List
 
 import numpy as np
 
-# On this rig, forward from the Nova bases toward the operator is taken as
-# negative base Y. Shift the existing allowed region by 150 mm; retain its
-# width, X bounds and table clearance. Confirm this direction onsite.
-WORKSPACE_X_RANGES_MM = {"left": (-450, 300), "right": (-250, 450)}
-WORKSPACE_Y_SHIFT_MM = -150
-WORKSPACE_Y_RANGE_MM = tuple(y + WORKSPACE_Y_SHIFT_MM for y in (-750, -160))
+# 2026-11-02 onsite labels supplied by the operator:
+# code "left" = .1 = physical right: toward operator is +X;
+# code "right" = .2 = physical left: toward operator is -X.
+# Translate each original X interval by 150 mm without changing its width.
+# Restore original Y bounds after correcting the earlier axis assumption.
+WORKSPACE_X_RANGES_MM = {"left": (-300, 450), "right": (-400, 300)}
+WORKSPACE_Y_RANGE_MM = (-750, -160)
 WORKSPACE_Z_MIN_MM = 40
 
 

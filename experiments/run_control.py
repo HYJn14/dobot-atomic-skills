@@ -657,7 +657,12 @@ def main(args):
         # Read the master pose exactly once per cycle. The servo branch reuses
         # this sample instead of calling agent.act again; the second read was
         # a serial USB roundtrip that added its own follow lag every cycle.
-        master_now = master_to_nova_action(agent.act({}))
+        try:
+            master_now = master_to_nova_action(agent.act({}))
+        except Exception as exc:
+            what_to_do[:, 1:] = 0
+            runtime_log("MASTER_STATE_FAILURE", error=f"{type(exc).__name__}: {exc}")
+            raise  # Do not dispatch using the preceding cycle's joint sample.
         action = master_now.copy()
         dev_what_to_do = what_to_do.copy()-last_status
         last_status = what_to_do.copy()
