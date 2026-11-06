@@ -8,7 +8,7 @@ import tyro
 from dobot_control.robots.dobot import DobotRobot
 from dobot_control.robots.robot import BimanualRobot, PrintRobot
 from dobot_control.robots.robot_node import ZMQServerRobot
-from task_skills.layout import physical_nova_ip
+from task_skills.layout import TELEOP_NOVA_SIDES, physical_nova_ip
 
 
 @dataclass
@@ -28,9 +28,12 @@ def launch_robot_server(args: Args):
 
 def _launch_owned_robot_server(args: Args):
     port = args.robot_port
-    _robot_l = DobotRobot(robot_ip=physical_nova_ip("left"), robot_number=2)
-    _robot_r = DobotRobot(robot_ip=physical_nova_ip("right"), robot_number=2)
-    robot = BimanualRobot(_robot_l, _robot_r)
+    # Preserve calibrated vector order: physical RIGHT (.1), LEFT (.2).
+    first, second = (
+        DobotRobot(robot_ip=physical_nova_ip(side), robot_number=2)
+        for side in TELEOP_NOVA_SIDES
+    )
+    robot = BimanualRobot(first, second)
     server = ZMQServerRobot(robot, port=port, host=args.hostname)
     print(f"Starting robot server on port {port}")
     server.serve()

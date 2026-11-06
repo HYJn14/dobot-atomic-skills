@@ -44,10 +44,11 @@ def check_pose_protection(positions, velocities, nova_flags):
     for side, active in sides:
         if not active:
             continue
+        physical_side = "RIGHT (.1)" if side == "left" else "LEFT (.2)"
         tip_names = (f"{side}_left", f"{side}_right")
         if any(velocities[name][2] < -1 for name in tip_names):
             warnings.append(
-                f"[Warn]:The {side} robot speed of the TCP is moving too fast!"
+                f"[Warn]:The {physical_side} robot speed of the TCP is moving too fast!"
             )
             warnings.append(f"delta_{tip_names[0]}: {velocities[tip_names[0]][2]}")
             protected = True
@@ -55,7 +56,7 @@ def check_pose_protection(positions, velocities, nova_flags):
             is_within_workspace(positions_mm[name], side)
             for name in tip_names
         ):
-            warnings.append(f"[Warn]:The {side} arm is out of the safe zone!")
+            warnings.append(f"[Warn]:The {physical_side} arm is out of the safe zone!")
             protected = True
 
     for warning in warnings:

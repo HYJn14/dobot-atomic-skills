@@ -1,3 +1,4 @@
+import ast
 import inspect
 import sys
 import threading
@@ -282,13 +283,13 @@ class BimanualDispatchTests(unittest.TestCase):
 
 
 class CommandFlagTransportTests(unittest.TestCase):
-    def test_master_arm_flags_cross_but_gripper_flags_stay_same_side(self):
+    def test_master_arm_and_gripper_flags_use_the_same_nova_order(self):
         master_flags = np.array([1, 0])
 
         np.testing.assert_array_equal(master_to_nova_flags(master_flags), [0, 1])
         np.testing.assert_array_equal(
             master_to_nova_gripper_flags(master_flags),
-            [1, 0],
+            [0, 1],
         )
 
     def test_single_master_updates_only_same_side_nova_gripper(self):
@@ -306,17 +307,41 @@ class CommandFlagTransportTests(unittest.TestCase):
             gripper_flags=[1, 0],
         )
 
-        self.assertEqual(result[6], 0.2)
+        self.assertEqual(result[6], 0.8)
         self.assertEqual(result[13], 0.5)
 
     def test_gripper_target_is_clamped_to_normalized_range(self):
         raw_master = np.zeros(14)
-        raw_master[6] = 4.0
+        raw_master[13] = 4.0
         crossed_master = master_to_nova_action(raw_master)
         result = apply_same_side_gripper_targets(
             np.zeros(14), crossed_master, np.zeros(14), gripper_flags=[1, 0]
         )
         self.assertEqual(result[6], 1.0)
+
+    def test_each_master_dispatches_only_its_own_mapped_gripper(self):
+        raw_master = np.zeros(14)
+        raw_master[6], raw_master[13] = 0.2, 0.8
+        mapped = master_to_nova_action(raw_master)
+        for master in range(2):
+            with self.subTest(master=master):
+                flags = np.zeros(2, dtype=int)
+                flags[master] = 1
+                gripper_flags = master_to_nova_gripper_flags(flags)
+                previous = np.full(14, 0.5)
+                action = apply_same_side_gripper_targets(
+                    previous, mapped, previous, gripper_flags)
+                robots = [FakeRobot(), FakeRobot()]
+                BimanualRobot(*robots).command_joint_state(
+                    action, arm_flags=[0, 0], gripper_flags=gripper_flags)
+                slot = 1 - master
+                self.assertEqual(robots[master].commands, [])
+                self.assertEqual(len(robots[slot].commands), 1)
+                command, arm_enabled, grip_enabled = robots[slot].commands[0]
+                self.assertFalse(arm_enabled)
+                self.assertTrue(grip_enabled)
+                self.assertEqual(command[6], raw_master[master * 7 + 6])
+                self.assertEqual(action[master * 7 + 6], 0.5)
 
     def test_env_forwards_arm_and_gripper_flags_separately(self):
         robot = FakeEnvRobot()
@@ -670,6 +695,111 @@ class MasterSerialRecoveryTests(unittest.TestCase):
         env.step.assert_not_called()
         self.assertFalse(states[:, 1:].any())
         self.assertEqual(replacements["runtime_log"].call_args.args[0], "MASTER_STATE_FAILURE")
+
+
+class ConfirmedPhysicalLayoutTests(unittest.TestCase):
+    def test_dobot_driver_opens_gripper_on_confirmed_arm(self):
+        from dobot_control.gripper import dobot_gripper
+        from dobot_control.robots import dobot_api
+        for ip, port, servo_id in (("192.168.5.1", "COM4", 22),
+                                  ("192.168.5.2", "COM3", 21)):
+            with patch.object(dobot_api, "DobotApiMove"), \
+                    patch.object(dobot_api, "DobotApiDashboard"), \
+                    patch.object(dobot_api, "DobotApiStatus"), \
+                    patch.object(dobot_gripper, "DobotGripper") as gripper, \
+                    patch.object(DobotRobot, "_initialize_gripper"), \
+                    patch.object(DobotRobot, "_start_reading_thread"), \
+                    patch.dict("os.environ", {"DOBOT_ACT_RECORDING": "0"}):
+                DobotRobot(ip)
+            self.assertEqual(gripper.call_args.kwargs["port"], port)
+            self.assertEqual(gripper.call_args.kwargs["id_name"], servo_id)
+
+    def test_server_and_home_keep_calibrated_ip_order(self):
+        from experiments import launch_nodes
+        from scripts.manipulate_utils import robot_pose_init
+        from task_skills.layout import physical_nova_ip, physical_nova_gripper_binding
+        self.assertEqual(physical_nova_ip("right"), "192.168.5.1")
+        self.assertEqual(physical_nova_ip("left"), "192.168.5.2")
+        self.assertEqual(physical_nova_gripper_binding("right"), ("GRIPPER_RIGHT", "COM4"))
+        self.assertEqual(physical_nova_gripper_binding("left"), ("GRIPPER_LEFT", "COM3"))
+        with patch.object(launch_nodes, "DobotRobot") as robot, \
+                patch.object(launch_nodes, "BimanualRobot"), \
+                patch.object(launch_nodes, "ZMQServerRobot"):
+            launch_nodes._launch_owned_robot_server(launch_nodes.Args())
+        self.assertEqual([c.kwargs["robot_ip"] for c in robot.call_args_list],
+                         ["192.168.5.1", "192.168.5.2"])
+        env = Mock()
+        env.get_obs.return_value = {"joint_positions": np.deg2rad(
+            [90, 0, 90, 0, -90, -90, 0, -90, 0, -90, 0, 90, 90, 0])}
+        robot_pose_init(env)
+        env.step.assert_not_called()
+
+    def test_alarm_names_physical_side_instead_of_vector_slot(self):
+        for ip, side in (("192.168.5.1", "right"), ("192.168.5.2", "left")):
+            robot = FakeRobot()
+            robot.robot_ip = ip
+            robot.robot_is_err = True
+            robot._status_failure = "controller alarm"
+            with self.assertRaisesRegex(RuntimeError, f"{side} robot error: controller alarm"):
+                BimanualRobot._require_ready(robot, "legacy-slot")
+
+
+class ServoFailureRecoveryTests(unittest.TestCase):
+    def test_light_failure_does_not_interrupt_servo_recovery(self):
+        from experiments import run_control as control
+
+        # Execute the real recovery branch without starting hardware or threads.
+        tree = ast.parse(inspect.getsource(control.main))
+        handler = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.ExceptHandler)
+            and any(isinstance(child, ast.Constant) and child.value == "SERVO_FAILURE"
+                    for child in ast.walk(node))
+        )
+        loop = ast.For(target=ast.Name(id="_cycle", ctx=ast.Store()),
+                       iter=ast.Tuple(elts=[ast.Constant(0)], ctx=ast.Load()),
+                       body=handler.body, orelse=[])
+        code = compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])),
+                       control.__file__, "exec")
+        for light_fails in (False, True):
+            for state_read_fails in (False, True):
+                with self.subTest(light_fails=light_fails, state_read_fails=state_read_fails):
+                    states = np.ones((2, 3), dtype=int)
+                    env, agent, planner, log = Mock(), Mock(), Mock(), Mock()
+                    joints = np.arange(14, dtype=float)
+                    env.get_obs.return_value = {"joint_positions": joints}
+                    if state_read_fails:
+                        env.get_obs.side_effect = RuntimeError("state unavailable")
+                    light = Mock(side_effect=RuntimeError("controller alarm") if light_fails else None)
+                    generation = [3]
+                    original_error = RuntimeError("right robot error: controller alarm")
+                    previous_action = np.zeros(14)
+                    scope = dict(exc=original_error, action=joints, last_action=previous_action,
+                                 flag_in=np.ones(2), env=env, agent=agent, planner=planner,
+                                 runtime_log=log, set_light=light, what_to_do=states,
+                                 _button_state_reset_generation=generation,
+                                 start_servo=True, safe_limit=5, active_record_failed=False)
+                    exec(code, scope)
+
+                    light.assert_called_once_with(env, "red", 1)
+                    self.assertEqual(agent.set_torque.call_args_list,
+                                     [unittest.mock.call(0, True), unittest.mock.call(1, True)])
+                    np.testing.assert_array_equal(states[:, 0], [1, 1])
+                    self.assertFalse(states[:, 1:].any())
+                    self.assertEqual(generation, [4])
+                    self.assertFalse(scope["start_servo"])
+                    self.assertTrue(scope["active_record_failed"])
+                    self.assertEqual(scope["safe_limit"], 0)
+                    planner.reset.assert_called_once_with()
+                    env.get_obs.assert_called_once_with()
+                    np.testing.assert_array_equal(scope["last_action"],
+                                                  previous_action if state_read_fails else joints)
+                    events = [call.args[0] for call in log.call_args_list]
+                    self.assertEqual(events, ["SERVO_FAILURE"]
+                                     + (["RECOVERY_LIGHT_FAILED"] if light_fails else [])
+                                     + (["RECOVERY_STATE_READ_FAILED"] if state_read_fails else []))
+                    self.assertEqual(log.call_args_list[0].kwargs["error"],
+                                     f"RuntimeError: {original_error}")
 
 
 class BoundedAsyncWriterTests(unittest.TestCase):

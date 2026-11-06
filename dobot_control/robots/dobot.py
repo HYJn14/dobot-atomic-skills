@@ -2,6 +2,7 @@ from typing import Dict
 import numpy as np
 import time
 from dobot_control.robots.robot import Robot
+import os
 import struct
 import sys
 from scripts.manipulate_utils import load_ini_data_hands, load_ini_data_gripper
@@ -39,7 +40,7 @@ class DobotRobot(Robot):
         self.r_inter.SetTool(1, 0, 0, 197, 0, 0, 0)  # 设置夹爪工具坐标系
         self.r_inter.Tool(1)  # 设置当前工具坐标系，使得Getpose()获取坐标时为此工具下
 
-        self.com_list = {"192.168.5.1": "GRIPPER_LEFT", "192.168.5.2": "GRIPPER_RIGHT"}  # left, right
+        self.com_list = {"192.168.5.1": "GRIPPER_RIGHT", "192.168.5.2": "GRIPPER_LEFT"}
         _, gripper_dict = load_ini_data_gripper()
         self.gripper_list = gripper_dict[self.com_list[robot_ip]].pos
         self.gripper_id_name = gripper_dict[self.com_list[robot_ip]].id_name
@@ -72,9 +73,14 @@ class DobotRobot(Robot):
         # with the ServoJ RPC and dominated the per-arm follow latency.
         self._last_gripper_cmd = None
         self._start_reading_thread()
+        self._act_feedback = None
+        if os.environ.get("DOBOT_ACT_RECORDING") == "1" and self._use_gripper:
+            from dobot_control.act_recording import GripperFeedback
+            self._act_feedback = GripperFeedback(self.gripper, self._stop_thread)
+            print(f"[ACT] measured gripper feedback enabled: {robot_ip}", flush=True)
 
     def _initialize_gripper(self):
-        # launch_nodes constructs LEFT then RIGHT. Wait for each endpoint so
+        # launch_nodes constructs physical RIGHT (.1) then LEFT (.2). Wait so
         # the next gripper cannot start while this one's cycle is unfinished.
         for target in (0, 255):
             print(f"[GRIPPER MOVE] target={target} speed=10", flush=True)
@@ -194,16 +200,6 @@ class DobotRobot(Robot):
             detail = failure or "status monitor reported an error"
             raise RuntimeError(f"{self.robot_ip}: {detail}")
 
-    def _get_gripper_pos(self) -> float:
-        # import time
-        self._require_ready()
-        gripper_pos = self.gripper.get_current_position()
-        # gripper_pos = self.get_current_position()
-        # print("gripper_pos:",gripper_pos)
-        assert 0 <= gripper_pos <= 255, "Gripper position must be between 0 and 255"
-        return np.abs(1 - gripper_pos / 255)
-        # return np.abs(gripper_pos / 255)
-
     def get_joint_state(self) -> np.ndarray:
         """Get the current state of the leader robot.
 
@@ -313,27 +309,35 @@ class DobotRobot(Robot):
             self.r_inter.StopDrag()
 
     def get_observations(self) -> Dict[str, np.ndarray]:
-        assert not self.robot_is_err, f"{self.robot_ip}: error!"
+        self._require_ready()
+        begin = time.perf_counter()
         joints = self.get_joint_state()
-        pos_quat = np.zeros(7)
-        gripper_pos = np.array([joints[-1]])
-        return {
+        measured = time.perf_counter()
+        result = {
             "joint_positions": joints,
-            "joint_velocities": joints,
-            "ee_pos_quat": pos_quat,
-            "gripper_position": gripper_pos,
+            "joint_velocities": np.zeros_like(joints),
+            "ee_pos_quat": np.zeros(7),
+            "gripper_position": np.array([joints[-1]]),
         }
+        feedback = getattr(self, "_act_feedback", None)
+        if feedback is not None:
+            value, timestamp, valid = feedback.snapshot()
+            actual = joints.copy()
+            actual[-1] = value
+            result.update(
+                dataset_joint_positions=actual,
+                gripper_position=np.array([value]),
+                _act_qvel_valid=np.array([False]),
+                _act_ee_pose_valid=np.array([False]),
+                _act_state_time=np.array([measured]),
+                _act_state_begin=np.array([begin]),
+                _act_gripper_time=np.array([timestamp]),
+                _act_gripper_valid=np.array([valid]),
+            )
+        return result
 
     def get_obs(self) -> Dict[str, np.ndarray]:
-        joints = self.get_joint_state()
-        pos_quat = np.zeros(7)
-        gripper_pos = np.array([joints[-1]])
-        return {
-            "joint_positions": joints,
-            "joint_velocities": joints,
-            "ee_pos_quat": pos_quat,
-            "gripper_position": gripper_pos,
-        }
+        return self.get_observations()
 
     def get_DI_state(self, index):
         assert not self.robot_is_err, f"{self.robot_ip}: error!"

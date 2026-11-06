@@ -187,8 +187,8 @@ class RegistryTests(unittest.TestCase):
     def test_resources_include_the_shared_workspace_and_gripper_port(self):
         self.assertIn("workspace:shared",
                       derive_resources("arm.move_joint", "left", self.profile))
-        self.assertIn("serial:COM8", derive_resources("gripper.set_position", "left", self.profile))
-        self.assertIn("serial:COM7", derive_resources("gripper.set_position", "right", self.profile))
+        self.assertIn("serial:COM3", derive_resources("gripper.set_position", "left", self.profile))
+        self.assertIn("serial:COM4", derive_resources("gripper.set_position", "right", self.profile))
 
 
 class GraphContractTests(unittest.TestCase):

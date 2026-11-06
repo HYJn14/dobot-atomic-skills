@@ -4,6 +4,8 @@
 
 当前链路：**上游生成执行图 → 网关校验 → 原子技能执行 → 状态查询与事件回传**。现场人工入口同时保留中文指令编排。
 
+当前 NOVA2 实机：**RIGHT 右 .1 / COM4 / ID22；LEFT 左 .2 / COM3 / ID21**。日常操作与近期修改见 [主操作手册](TELEOP_WINDOWS_SETUP.zh-CN.md)，ACT 数据流程见 [采集手册](manuals/ACT_DEMONSTRATION_COLLECTION.zh-CN.md)。
+
 ## 已有功能
 
 - 单臂 A/B 抓放、垂直接近与抬升、运输高度和归位流程。
@@ -102,3 +104,7 @@ python -B tests/gateway_cli_smoke.py --output ./gateway-data/cli-smoke
 本仓库以 2026-10-12 工作镜像为来源，包含截至 10 月 5 日的执行网关改动、原子技能、相关底层控制、遥操作/采集支撑模块、SDK 和测试。上传目录为独立快照；模型训练目录、模型权重、数据集、现场运行日志、数据库、缓存及原 Git 历史未纳入。
 
 基础控制工程来自 Dobot X-Trainer，原始说明见 [Dobot README](docs/upstream/README.dobot.md)。保留 [LICENSE](LICENSE)、[第三方说明](THIRD-PARTY-LICENSES)及 SDK 各自许可证。
+
+## ACT 示教采集
+
+Windows 双臂拧瓶盖采集、质量检查、标注及 HDF5 导出见 [ACT 示教数据采集操作手册](manuals/ACT_DEMONSTRATION_COLLECTION.zh-CN.md)。本机只需采集与转换依赖，不安装训练或推理框架。旧三相机转换脚本已由 `python -m dobot_control.act_dataset` 替代。

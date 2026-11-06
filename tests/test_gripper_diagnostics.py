@@ -1,3 +1,4 @@
+import threading
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -17,6 +18,7 @@ class FakeServo:
 
 def make_gripper(response):
     gripper = DobotGripper.__new__(DobotGripper)
+    gripper.command_lock = threading.RLock()
     gripper.servo = FakeServo(response)
     gripper._servo_id = 22
     gripper._min_servo_pos = 2000

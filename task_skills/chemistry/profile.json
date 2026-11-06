@@ -4,8 +4,8 @@
   "units": {"position": "mm", "rotation": "deg", "joint": "deg"},
   "frame": {"user": 0, "tool": 0, "rotation_convention": "Rz(rz) Ry(ry) Rx(rx)"},
   "arms": {
-    "left": {"ip": "192.168.5.1", "gripper_port": "COM8", "gripper_id": 22, "servo_pos": [2048, 3052], "speed_default": 20},
-    "right": {"ip": "192.168.5.2", "gripper_port": "COM7", "gripper_id": 21, "servo_pos": [2048, 3052], "speed_default": 20}
+    "left": {"ip": "192.168.5.2", "gripper_port": "COM3", "gripper_id": 21, "servo_pos": [2048, 3052], "speed_default": 20},
+    "right": {"ip": "192.168.5.1", "gripper_port": "COM4", "gripper_id": 22, "servo_pos": [2048, 3052], "speed_default": 20}
   },
   "gripper": {"open": 255, "closed_target": 0, "open_minimum": 250, "evidence": "position_feedback_only; not object-presence or grasp-force confirmation"},
   "poses": {

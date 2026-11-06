@@ -1,12 +1,19 @@
 # Windows 本机双臂遥操部署与操作手册
 
-更新：2026-11-05（北京时间）。对照源码：分支 `windows_teleop`，以 `a97d247` 为基线并包含本地的主手串口恢复、工作区 X 平移及 J6 参考角修正。手册更新与离线修复验证未启动实体控制程序或改动 INI。
+更新：2026-11-06（北京时间）。本手册对应当前工作树，纳入 ACT 采集、相机全画幅、夹爪窗口、异常恢复及 NOVA2 实机绑定修正。
 
 ## 0. 当前状态与使用入口
 
-2026-11-05 状态：用户确认最新版代码已经跑通。实际录制根目录为 `E:\Dobot\datasets\dataset_package_test\collect_data`，已发现三段同名 JPG/PKL 配对录制（3046、465、985 对）。本页原有待验收说明保留作逐项记录边界，不代表用户本次确认被撤销。
+2026-11-06 用户确认的实机标准如下，代码、配置、窗口和新录制元数据均按此对应：
 
-用户已确认 10 月版本的遥操可以成功运行。11 月 2 日版本已修改工作区、跟随限速和录制，清理前 90 项相关离线测试通过；当前 X 平移范围、J6 修正及真机录制仍待现场验收，不能把旧版本调通等同于本轮真机验收。
+| 实体从臂 | 标准侧别 | IP | 夹爪配置段 | 串口 / ID |
+| --- | --- | --- | --- | --- |
+| 右 NOVA2 | RIGHT / right | 192.168.5.1 | GRIPPER_RIGHT | COM4 / ID22 |
+| 左 NOVA2 | LEFT / left | 192.168.5.2 | GRIPPER_LEFT | COM3 / ID21 |
+
+日常遥操使用本手册；拧瓶盖示教采集、数据检查/回看/标注/转换使用 [ACT 操作手册](manuals/ACT_DEMONSTRATION_COLLECTION.zh-CN.md)；单独全开/全闭夹爪使用 [夹爪窗口](docs/gripper-panel.zh-CN.md)。
+
+2026-11-05 用户确认此前遥操版本跑通。11 月 6 日已有 4 段 ACT 调试录制并完成回看和 failure 标注，详见下方更新记录。当前绑定修正后需重启 A、B，并分别核对双臂与两夹爪；本次软件核对不启动真机。
 
 | 项目 | 当前版本 |
 | --- | --- |
@@ -14,18 +21,39 @@
 | 代码仓库 | `https://github.com/HYJn14/dobot-atomic-skills`，分支 `windows_teleop`；原上游 `yanggoumao2` 保留作来源 |
 | 主手验证标志 | INI 两侧 `absolute_mapping_verified = 1`；已有新偏置，日常启动不要重置或重算 |
 | 正常跟随 / 慢速对齐 | 默认 `3.2 rad/s` / `0.15 rad/s` |
-| 工作区 | 实体右臂 .1（代码 left）X `[-300,450]`、实体左臂 .2（代码 right）X `[-400,300]`、两侧 Y `[-750,-160]`、Z **严格大于 40**，单位 mm |
+| 工作区 | 实体右臂 .1（旧向量槽 left）X `[-300,450]`、实体左臂 .2（旧向量槽 right）X `[-400,300]`、两侧 Y `[-750,-160]`、Z **严格大于 40**，单位 mm |
 | 工作区变更含义 | 撤销 Y 平移；.1 的 X 加 150 mm，.2 的 X 减 150 mm，区间宽度不变；允许区平移本身不自动移动机器人 |
 | 启用相机 | 仅顶部 D405 `218622278417`，640×480 RGB/Depth，15 fps |
 | 录制 | 单相机可录；已开启跟随后，任一 B 完整按下并释放开始，再按一次停止 |
 | 输出根目录 | `E:\Dobot\datasets\dataset_package_test\collect_data` |
 | 测试脚本清理 | 9 份本地调试测试已移出；上游回归测试和环境检查工具保留 |
 
-**实体与代码通道：** 用户已根据坐标图确认实体右臂为 .1（代码名 left），朝操作者为该臂 +X；实体左臂 .2（代码名 right）方向相反。现已按此修正 X 并恢复原 Y；不交换 IP 或通道名称。另据原始标定记录修正 .1 对应 HAND_RIGHT 的 J6 参考角符号，解决 ALIGN_START 近半圈旋转，详情见 `docs/workspace-x-wrist-correction-20261102.zh-CN.md`。现场仍需复测范围和姿态。
+**实体侧别与数据顺序：** 实体 RIGHT=.1，LEFT=.2。遥操的 14 维向量继续按 `[RIGHT .1 六轴/夹爪, LEFT .2 六轴/夹爪]` 排列；FK/安全检查中的历史 `left/right` 键分别表示第一/第二槽。`HAND_LEFT/HAND_RIGHT` 是主手配置段，不随从臂侧别改名。主手标定、既有交叉路由、工作区和限速保持现有数值。报警信息按从臂 IP 显示实体侧别。
 
 日常操作：核对第 6 节配置和第 7.2 节姿态 → 按第 9 节先 A 后 B 启动 → 第 10.1 节跟随 → 第 10.2 节录制 → 第 11 节退出。**第 7.1 节仅供换设备、改装或发现映射异常后的重新标定，不是每次开机的必做步骤。**
 
 本手册以仓库内版本为维护源，工作区根目录副本同步更新。路径、设备参数与标定值只对应当前装置，迁移机器时须重新核对。历史交接文档与旧日志只供追溯，不能覆盖本文当前状态。
+
+## 0.1 近期修改与当前操作变化
+
+| 修改 | 当前操作 / 生效方式 |
+| --- | --- |
+| ACT 真实数据采集 | A、B 都设置 `DOBOT_ACT_RECORDING=1`；记录实际六轴/夹爪、时间、有效性、使能和最终动作；发送失败的 episode 标记 aborted；正常结束写 closed.json |
+| 相机全画幅 | 完整 640×480，去掉顶部裁切和拉伸，保留默认 180°旋转；图像流程版本 2；预览与采集方向相同 |
+| B 键共享录制 | 两只 B 切换同一会话：右 B 开始后左 B 可停止；同轮双释放切换一次，跨轮释放会切换两次；ACT 完整任务要求双臂/双夹爪使能 |
+| 主手夹爪路由 | 按本次现场反馈交换原夹爪路由，夹爪目标、使能及对齐门控统一到对应从臂；六轴路由保持 |
+| 夹爪端点 | 驱动 0 完全闭合、255 完全打开；ACT 归一化为 0 闭合、1 打开 |
+| 夹爪小窗口 | 双击 `open_gripper_panel.cmd`；左 COM3/ID21，右 COM4/ID22；速度 10，每次只发送一次；使用前退出 A/B，遵守共享设备锁 |
+| 异常恢复 | ServoJ 失败后亮红灯若再次失败，记录 RECOVERY_LIGHT_FAILED，仍继续锁主手、清除跟随/录制状态并复位规划器；控制柜报警在 DobotStudio 查明原因后处理 |
+| 本次绑定修正 | .1 RIGHT+COM4/ID22，.2 LEFT+COM3/ID21；原子技能和化学 profile 同步；遥操向量仍按 .1、.2；home 数值随 IP 保持 |
+
+绑定修正涉及 A 的夹爪连接，需停止录制和跟随、退出 B、退出 A，按 11.2 核验旧锁后，先 A 后 B 重启。仅相机画幅变化时原本只需重启 B，本次绑定修正须同时重启 A。
+
+**新数据版本：** 使用 `--project-name bottle_cap_layout_v2`，输出 `E:\Dobot\datasets\bottle_cap_layout_v2\collect_data`。新元数据 `hardware_layout_version=2` 标明绑定；转换器拒绝与旧绑定混合导出。旧调试记录和元数据保持原样。
+
+此前 `bottle_cap_v1` 的 4 段调试数据均标为 failure，已生成各段 preview.mp4；第一段技术检查通过，其余含过短或单侧跟随关闭问题，标准导出为 0 条 HDF5。验收记录：`E:\Dobot\datasets\bottle_cap_v1\空载录制验收结果_20261106.md`。完整空载验收需在新绑定下分别明显开闭两只夹爪：双侧对齐 → B 开始 → 开闭双夹爪和缓慢移动双臂约 10 秒 → B 停止 → 等待落盘 → 关闭跟随。
+
+修改依据与详细记录：[ACT 改造](docs/act-collection-changes-20261106.zh-CN.md)、[相机/B 键](docs/camera-fullframe-fix-20261106.zh-CN.md)、[夹爪窗口](docs/gripper-panel.zh-CN.md)、[实机绑定修正](docs/nova2-physical-layout-20261106.zh-CN.md)。
 
 ## 1. 软件分工与资料
 
@@ -85,7 +113,7 @@ E:\Dobot\.venv\Scripts\python.exe -X utf8 -B experiments\run_control.py --help
 E:\Dobot\.venv\Scripts\python.exe -X utf8 -B -m unittest tests.test_teleop_regressions tests.test_gripper_diagnostics
 ```
 
-9 份本地调试测试已按用户要求移出，旧文档中的 `tests.test_absolute_teleop` 等命令不再可用。清理前 90 项测试通过的历史记录见 `docs/teleop-fixes-20261102.zh-CN.md`；本次手册更新只做文档与源码核对，没有重跑硬件或功能测试。
+9 份本地调试测试已按用户要求移出，旧文档中的 `tests.test_absolute_teleop` 等命令不再可用。清理前 90 项测试通过的历史记录见 `docs/teleop-fixes-20261102.zh-CN.md`；本次相关回归结果见实机绑定修正记录。
 
 ## 4. 接线与设备枚举
 
@@ -102,7 +130,7 @@ E:\Dobot\.venv\Scripts\python.exe -X utf8 -B tools\check_teleop_local.py --inven
 
 | 设备/端口 | 配置或用途 |
 | --- | --- |
-| 代码左 Nova / 代码右 Nova | `192.168.5.1` / `192.168.5.2` |
+| 实体右 Nova RIGHT / 实体左 Nova LEFT | `192.168.5.1` / `192.168.5.2` |
 | 电脑有线网卡 | 当前工作网段为 `192.168.5.x`；例如未占用的 `192.168.5.10/24`，不得与 .1/.2 重复 |
 | 29999 / 30003 / 30004 | Dashboard / 运动（含 ServoJ）/ 状态反馈 |
 | 22000 | HTTP 固件与型号查询 |
@@ -118,13 +146,13 @@ E:\Dobot\.venv\Scripts\python.exe -X utf8 -B tools\check_teleop_local.py --inven
 
 | 输入/设备 | 当前配置 | 六轴目标 / 夹爪通道 |
 | --- | --- | --- |
-| HAND_LEFT / hand=0 | COM6，2 Mbps，J1～J6 IDs `1,2,4,5,6,7`，append3，grip8，verified=1 | 六轴 → 右 Nova .2；夹爪 → .1 通道 |
-| HAND_RIGHT / hand=1 | COM5，2 Mbps，J1～J6 IDs `11,12,14,15,16,17`，append13，grip18，verified=1 | 六轴 → 左 Nova .1；夹爪 → .2 通道 |
-| GRIPPER_LEFT | COM3，ID21，行程 `2048,3052` | 绑定 .1 |
-| GRIPPER_RIGHT | COM4，ID22，行程 `2048,3052` | 绑定 .2 |
+| HAND_LEFT / hand=0 | COM6，2 Mbps，J1～J6 IDs `1,2,4,5,6,7`，append3，grip8，verified=1 | 六轴及夹爪 → LEFT .2 / COM3 / ID21 |
+| HAND_RIGHT / hand=1 | COM5，2 Mbps，J1～J6 IDs `11,12,14,15,16,17`，append13，grip18，verified=1 | 六轴及夹爪 → RIGHT .1 / COM4 / ID22 |
+| GRIPPER_LEFT | COM3，ID21，行程 `2048,3052` | LEFT .2 |
+| GRIPPER_RIGHT | COM4，ID22，行程 `2048,3052` | RIGHT .1 |
 | CAMERA | enabled=top，fps=15，top=218622278417 | 侧相机配置不启用，不要求接入 |
 
-配置名称 LEFT/RIGHT 不等于实体左右。INI 的 `HAND_RIGHT.physical_side=left`；`HAND_LEFT.physical_side=unverified` 是尚未补全的标签字段，不能把 verified=1 推导为该标签已独立核验。夹爪通道也需用实物接线确认，不从六轴交叉路由推断。
+配置名称 LEFT/RIGHT 不等于实体左右。INI 的 `HAND_RIGHT.physical_side=left`；`HAND_LEFT.physical_side=unverified` 是尚未补全的标签字段，不能把 verified=1 推导为该标签已独立核验。从臂和夹爪按本手册第 0 节的实机标准绑定。主手标签字段继续保留现有记录。
 
 当前 offsets（rad）原样保留，不作为重新标定的抄写模板：
 
@@ -173,8 +201,8 @@ q_slave_reference_rad = DobotStudio实际关节角(°) × π / 180
 
 | 本轮处理对象 | 主手配置 / 按键日志 | 主手端口、六轴 ID（依次对应 J1～J6） | 对应从臂 |
 | --- | --- | --- | --- |
-| 第一对 | HAND_RIGHT / hand=1；用户本轮描述为实体左主手 | COM5；11,12,14,15,16,17 | 代码左 Nova，192.168.5.1 |
-| 第二对 | HAND_LEFT / hand=0；实体侧仍需追线核对 | COM6；1,2,4,5,6,7 | 代码右 Nova，192.168.5.2 |
+| 第一对 | HAND_RIGHT / hand=1；用户本轮描述为实体左主手 | COM5；11,12,14,15,16,17 | 实体 RIGHT Nova，192.168.5.1 |
+| 第二对 | HAND_LEFT / hand=0；实体侧仍需追线核对 | COM6；1,2,4,5,6,7 | 实体 LEFT Nova，192.168.5.2 |
 
 IDs13/3 是附加舵机，18/8 是主手夹爪输入；本次六轴标定不把它们插进 J1～J6 数组。每个 ID 是否确实对应这根物理关节，需要逐轴采样验证，不能只依据数字连续性判断。
 
@@ -212,14 +240,14 @@ notepad.exe $calIni
 
 | 目标 Nova | J1 | J2 | J3 | J4 | J5 | J6 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 左 .1 → 配 HAND_RIGHT / COM5 | 90° | 0° | 90° | 0° | −90° | −90° |
-| 右 .2 → 配 HAND_LEFT / COM6 | −90° | 0° | −90° | 0° | 90° | 90° |
+| 右 .1 → 配 HAND_RIGHT / COM5 | 90° | 0° | 90° | 0° | −90° | −90° |
+| 左 .2 → 配 HAND_LEFT / COM6 | −90° | 0° | −90° | 0° | 90° | 90° |
 
 4. 现场人员先检查当前位置到参考姿态的可行路径，再用 DobotStudio 的低速关节点动/小步寸动逐段摆到参考姿态。观察并避开桌面、另一只臂和相机，不因目标表看起来安全就直接运行自动归位。若参考姿态或路径无法确认安全，停在这里，不修改边界来通过。
 5. 到位并静止后，记录**实际反馈角度**和对应 IP、时间，保存关节面板截图。计算偏置时以本次实测六个值为准。例如显示 89.98° 就记 89.98°，不要当作精确 90°。
 6. 参考记录存到 `$calDir`。当你摆放主手时，从臂保持这个姿态、不再点动；第二对另记一组角度。
 
-本仓库 home 与官方原示例的左右角度相反，原因和对照见 7.2，不要混用。也不要把两个从臂都设成六个 0°；这不是当前布局的标定参考，且不满足当前 J3 方向检查。
+home 按实机 IP 对应，见 7.2。也不要把两个从臂都设成六个 0°；这不是当前布局的标定参考，且不满足当前 J3 方向检查。
 
 如果确需用其他参考姿态，公式仍可使用该姿态实测角，但必须有独立依据能把主手摆到对应的六轴姿态；且该操作不会改变 9.2 的 home 初始化检查。不能把“任意参考姿态完成零位换算”误认为 home 和运动路径已经验收。
 
@@ -382,16 +410,16 @@ $calErrors | Export-Csv -LiteralPath (Join-Path $calDir ($calSection + '-referen
 
 ### 7.2 从臂启动 home 与工具
 
-| 代码从臂 | home J1～J6（度） |
+| 实体从臂 | home J1～J6（度） |
 | --- | --- |
-| 左 .1 | `[90, 0, 90, 0, -90, -90]` |
-| 右 .2 | `[-90, 0, -90, 0, 90, 90]` |
+| 右 .1 / RIGHT | `[90, 0, 90, 0, -90, -90]` |
+| 左 .2 / LEFT | `[-90, 0, -90, 0, 90, 90]` |
 
-该左右定义与本地官方轻量版原示例的左右表相反；现场必须按 IP、实体和安装方向确认，不混抄旧表。`start_joints` 中的 ±1.57 rad 是参考近似值，不改变上述 home。
+home 数值继续跟随原 IP，修正侧别名称不交换两臂目标。`start_joints` 中的 ±1.57 rad 是参考近似值，不改变上述 home。
 
 `robot_pose_init()` 默认只检查姿态；六轴差异大于 `1e-6 rad` 时，未显式授权会以 `Safe stop before pose motion` 退出。该开关不影响服务使能或夹爪启动动作。可选授权见 9.3。
 
-服务构造时写入 `SetTool(1,0,0,197,0,0,0)` 并选用 Tool 1；必须与实际末端、负载和安装匹配。保护计算另外使用 FK 模型、约 0.2 m 工具长度及夹爪模型，不等于经标定的实际 TCP 或完整碰撞模型。观测中的夹爪值含占位/指令值，不能当作逐周期实测夹爪反馈。
+服务构造时写入 `SetTool(1,0,0,197,0,0,0)` 并选用 Tool 1；必须与实际末端、负载和安装匹配。保护计算另外使用 FK 模型、约 0.2 m 工具长度及夹爪模型，不等于经标定的实际 TCP 或完整碰撞模型。普通遥操的夹爪控制状态沿用指令值；ACT 模式另采集真实位置缓存及其时间、有效性，写入 dataset_joint_positions。
 
 ## 8. 独立相机检查（需要时才运行）
 
@@ -423,9 +451,9 @@ $env:DOBOT_DEVICE_LOCK_PATH = 'E:/Dobot/.local/runtime/device-owner'
 E:\Dobot\.venv\Scripts\python.exe -X utf8 -B experiments\launch_nodes.py --hostname 127.0.0.1 --robot-port 6001
 ```
 
-**该入口会立即操作硬件，没有额外 YES 确认。** 服务申请设备锁，依次构造左 .1 和右 .2：使能机器人；设置 SpeedFactor、AccJ、SpeedJ 为 5；写入 Tool 1；初始化该侧夹爪，再退出拖拽并启动状态监控。
+**该入口会立即操作硬件，没有额外 YES 确认。** 服务申请设备锁，依次构造实体右 RIGHT .1 和实体左 LEFT .2：使能机器人；设置 SpeedFactor、AccJ、SpeedJ 为 5；写入 Tool 1；初始化该侧夹爪，再退出拖拽并启动状态监控。
 
-左夹爪 COM3/ID21 完成 `move(0,10,1)` 和 `move(255,10,1)` 后才启动右夹爪 COM4/ID22。每个目标读位置、允许归一化 0～255 量程误差 5、最多等待 10 秒，到位后停 0.5 秒；失败中止后续启动。速度参数 10 不是实测线速度。观察 `[GRIPPER START]`、`[GRIPPER DONE]` 和 `Starting robot server on port 6001`，保持 A 运行。
+右夹爪 COM4/ID22 完成 `move(0,10,1)` 和 `move(255,10,1)` 后才启动左夹爪 COM3/ID21。每个目标读位置、允许归一化 0～255 量程误差 5、最多等待 10 秒，到位后停 0.5 秒；失败中止后续启动。速度参数 10 不是实测线速度。观察 `[GRIPPER START]`、`[GRIPPER DONE]` 和 `Starting robot server on port 6001`，保持 A 运行。
 
 若出现 `owned or quarantined`，按 11.2 核对旧所有者，不能修改锁路径或盲删锁来绕过。
 
@@ -496,7 +524,7 @@ E:\Dobot\datasets\dataset_package_test\collect_data\<episode时间编号>\
 └─ observation\0.pkl, 1.pkl, ...
 ```
 
-单顶部模式不创建 `leftImg` / `rightImg`。启用并验证更多相机后才创建对应目录。每个 pkl 保存采样时观测、同编号 `control` 动作及 `_teleop_camera_names`、`_teleop_capture_monotonic_s`、`_teleop_source_index`、`_teleop_dropped_before`。图像取相机线程最新 JPEG；15 fps 不等于控制或录制采样率，也不保证不同相机严格同步。不保存深度流为独立图像文件。
+单顶部模式不创建 `leftImg` / `rightImg`。启用并验证更多相机后才创建对应目录。每个 pkl 保存采样时观测、同编号 `control` 动作及 `_teleop_camera_names`、`_teleop_capture_monotonic_s`、`_teleop_source_index`、`_teleop_dropped_before`。图像、帧号与主机接收时间通过同一锁发布为快照；15 fps 不等于控制或录制采样率，也不保证不同相机严格同步。不保存深度流为独立图像文件。
 
 仅在停止录制、退出 B 后，可用下面的只读目录检查确认 JPG/PKL 数量，不加载外来 pickle：
 
@@ -508,7 +536,7 @@ Get-ChildItem -LiteralPath (Join-Path $episodeDir 'observation') -Filter '*.pkl'
 
 正常写完时顶部 JPG 与观测 PKL 应同编号配对、非空；队列溢出会丢弃源采样，`source_index` 可不连续。`RECORD_QUEUE_FULL` / `record_dropped` 表示写盘跟不上；`RECORD_WRITER_FAILURE` 表示写盘失败并停止录制，按错误检查磁盘、权限或图像缺失，不把按键成功当作写盘成功。
 
-`Args.save_data_path` 和 `project_name` 未声明为 CLI 字段，当前不能添加 `--save-data-path` 来改目录。原有训练转换脚本仍带独立路径/三视图假设，单视角录制成功不等于训练转换已适配。
+当前支持 `--save-data-path` 和 `--project-name`。ACT 模式通过 `python -m dobot_control.act_dataset` 完成 check / preview / label / convert，原三相机旧转换脚本已移除；完整步骤见 ACT 操作手册。
 
 ### 10.3 会影响实际行为的环境变量
 
@@ -589,7 +617,7 @@ Remove-Item Env:DOBOT_ALLOW_SAFE_POSE_INIT -ErrorAction SilentlyContinue
 | `docs/teleop-fixes-20261102.zh-CN.md` | 三项修改、90 项历史测试与清理记录 |
 | `manuals/HANDOFF_NEXT_CHAT.zh-CN.md` | 历史交接；正文旧状态以本手册为准 |
 
-`task_skills` 原子任务及 HTTP 网关是另一条入口，其夹爪绑定和 Tool 配置不能直接套用于本手册遥操链路。
+`task_skills` 原子任务及 HTTP 网关使用同一实机侧别和夹爪绑定；Tool、示教点及场景仍各自配置。旧场景的示教点需在修正后的 IP 对应关系下复核后再用。
 
 ## 14. 本版现场验收记录
 

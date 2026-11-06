@@ -723,14 +723,14 @@ class PhysicalLayoutTests(unittest.TestCase):
     def test_left_nova_uses_physically_left_gripper_channel(self):
         from task_skills.layout import physical_nova_gripper_binding
 
-        self.assertEqual(physical_nova_gripper_binding("left"), ("GRIPPER_RIGHT", "COM8"))
+        self.assertEqual(physical_nova_gripper_binding("left"), ("GRIPPER_LEFT", "COM3"))
 
     def test_right_nova_uses_physically_right_gripper_channel(self):
         from task_skills.layout import physical_nova_gripper_binding
 
-        self.assertEqual(physical_nova_gripper_binding("right"), ("GRIPPER_LEFT", "COM7"))
+        self.assertEqual(physical_nova_gripper_binding("right"), ("GRIPPER_RIGHT", "COM4"))
 
-    def test_live_adapter_consumes_crossed_physical_gripper_bindings(self):
+    def test_live_adapter_consumes_confirmed_physical_gripper_bindings(self):
         constructed_grippers = []
 
         class FakeResource:
@@ -768,7 +768,7 @@ class PhysicalLayoutTests(unittest.TestCase):
 
         self.assertEqual(
             [(value["port"], value["id_name"]) for value in constructed_grippers],
-            [("COM8", 22), ("COM7", 21)],
+            [("COM3", 21), ("COM4", 22)],
         )
 
 

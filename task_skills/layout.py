@@ -2,19 +2,22 @@ from typing import Dict, Tuple
 
 
 PHYSICAL_NOVA_IP: Dict[str, str] = {
-    "left": "192.168.5.1",
-    "right": "192.168.5.2",
+    "left": "192.168.5.2",
+    "right": "192.168.5.1",
 }
 
 PHYSICAL_NOVA_HOME_DEGREES: Dict[str, Tuple[float, ...]] = {
-    "left": (90, 0, 90, 0, -90, -90),
-    "right": (-90, 0, -90, 0, 90, 90),
+    "left": (-90, 0, -90, 0, 90, 90),
+    "right": (90, 0, 90, 0, -90, -90),
 }
 
 PHYSICAL_NOVA_GRIPPER_BINDINGS: Dict[str, Tuple[str, str]] = {
-    "left": ("GRIPPER_RIGHT", "COM8"),
-    "right": ("GRIPPER_LEFT", "COM7"),
+    "left": ("GRIPPER_LEFT", "COM3"),
+    "right": ("GRIPPER_RIGHT", "COM4"),
 }
+
+# Legacy teleop vectors/FK use .1 then .2; keep their calibrated order.
+TELEOP_NOVA_SIDES = ("right", "left")
 
 # Measured on this rig on 2026-09-24 during the single-arm object-A run: the
 # normalized gripper position is inverted relative to the Feetech driver

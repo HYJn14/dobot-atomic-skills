@@ -140,8 +140,8 @@ def test_execution_trace_persists_failure_evidence(tmp_path):
 def test_physical_nova_home_is_explicitly_separate_from_master_home():
     from task_skills.layout import physical_nova_home_degrees, master_home_radians
 
-    assert physical_nova_home_degrees("left") == (90, 0, 90, 0, -90, -90)
-    assert physical_nova_home_degrees("right") == (-90, 0, -90, 0, 90, 90)
+    assert physical_nova_home_degrees("left") == (-90, 0, -90, 0, 90, 90)
+    assert physical_nova_home_degrees("right") == (90, 0, 90, 0, -90, -90)
     assert master_home_radians("left") == (-1.57, 0, -1.57, 0, 1.57, 1.57)
     assert master_home_radians("right") == (1.57, 0, 1.57, 0, -1.57, -1.57)
 

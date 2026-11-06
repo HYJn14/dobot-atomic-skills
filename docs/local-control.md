@@ -2,21 +2,23 @@
 
 本文用于操作员直接运行原子抓放任务。入口为 `python -m task_skills.run_task`，支持已实现的中文指令模板。外部上游系统使用 HTTP 网关；本地任务不需要 HTTP 网关、`launch_nodes.py` 或 ZMQ 服务。
 
+> 2026-11-06：实机 IP/夹爪已统一。旧场景点位须在修正后的 IP 绑定下复核后再执行。
+
 ## 1. 环境与现场准备
 
 所有命令在当前仓库根目录执行。真机使用 Windows 和已配置的机器人 Python 环境；已有 Conda 环境可用 `conda activate dobot-xtrainer` 激活。预览只编译图并保存文件，不连接硬件。
 
 | 绑定 | 操作对象 | 放置目标 |
 | --- | --- | --- |
-| 物理左 Nova | A | target_A |
-| 物理右 Nova | B | target_B |
+| 物理左 Nova LEFT / .2 / COM3 / ID21 | A | target_A |
+| 物理右 Nova RIGHT / .1 / COM4 / ID22 | B | target_B |
 
 真机前确认：控制网络和串口可用，示教配置与装置一致，物体位于初始位置，目标无占用，当前无持物或未完成动作，急停可用。停止正在运行的 HTTP 网关、主手遥操作及其他控制进程。
 
 所有控制入口和代码副本共用同一个设备锁路径。在使用的每个终端中设置：
 
 ```powershell
-$env:DOBOT_DEVICE_LOCK_PATH = 'C:/DobotRuntime/device-owner'
+$env:DOBOT_DEVICE_LOCK_PATH = 'E:/Dobot/.local/runtime/device-owner'
 ```
 
 本地任务编译后的启动节点包含等待控制器、清报警、使能及配置速度，默认速度与加速度限制为 10%。必须先处理现场异常，不能用重复执行任务代替故障处置。本装置夹爪约定为 0 闭合、255 张开；重新安装或移植时须实测方向及物理通道。

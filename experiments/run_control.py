@@ -21,6 +21,9 @@ from dobot_control.agents.dobot_agent import DobotAgent
 from dobot_control.cameras.realsense_camera import RealSenseCamera
 from dobot_control.cameras.settings import CAMERA_NAMES, load_camera_settings
 from dobot_control.async_writer import BoundedAsyncWriter
+from dobot_control.act_recording import CameraSnapshots, atomic_json, enrich_observation
+
+act_cameras = CameraSnapshots()
 from dobot_control.absolute_teleop import AbsoluteTeleopPlanner, CommandInterval, DEFAULT_FOLLOW_SPEED_RAD_S
 from dobot_control.teleop_safety import (
     MasterRunawayGuard,
@@ -36,8 +39,8 @@ class Args:
     robot_port: int = 6001
     hostname: str = "127.0.0.1"
     show_img: bool = False
-    save_data_path = str(Path(__file__).parent.parent.parent)+"/datasets/"
-    project_name = "dataset_package_test"
+    save_data_path: str = str(Path(__file__).parent.parent.parent)+"/datasets/"
+    project_name: str = "dataset_package_test"
 
 
 # Thread button: [lock or nor, servo or not, record or not]
@@ -87,6 +90,9 @@ class RecordingSample:
 
 
 def write_recording_sample(sample):
+    if isinstance(sample, dict):
+        atomic_json(Path(sample["episode_dir"]) / "closed.json", sample)
+        return
     episode_dir = Path(sample.episode_dir)
     if len(sample.images) != len(sample.camera_names) or not sample.camera_names:
         raise ValueError("Recording requires one image per enabled camera")
@@ -103,6 +109,23 @@ def write_recording_sample(sample):
         output_path.write_bytes(jpeg_image)
     observations = dict(sample.observations)
     observations["_teleop_camera_names"] = np.asarray(sample.camera_names)
+    if "_act_schema" in observations and not (episode_dir / "episode.json").exists():
+        import hashlib
+        config = Path(BASE_DIR) / "scripts/dobot_config/dobot_settings.ini"
+        atomic_json(episode_dir / "episode.json", {
+            "schema": 2, "task": "bottle_cap_open", "status": "unreviewed",
+            "camera_names": list(sample.camera_names),
+            "channel_order": ["192.168.5.1 J1..J6", "192.168.5.1 gripper", "192.168.5.2 J1..J6", "192.168.5.2 gripper"],
+            "physical_side_note": "operator confirmed 2026-11-06: .1 RIGHT; .2 LEFT",
+            "hardware_layout_version": 2,
+            "gripper_ports": {"192.168.5.1": "COM4/ID22", "192.168.5.2": "COM3/ID21"},
+            "joint_unit": "rad", "gripper": "driver position / 255; 0=fully closed, 1=fully open (onsite confirmed 2026-11-06)",
+            "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+            "top_crop": None, "top_flip": True,
+            "image_pipeline_version": 2, "image_size": [480, 640],
+            "clock": "host perf_counter seconds; camera host receive time, not exposure time",
+            "send_ok_semantics": "env.step RPC returned without exception; not controller arrival acknowledgement",
+        })
     save_frame(str(obs_dir) + os.sep, sample.index, observations, sample.action)
 
 
@@ -227,19 +250,18 @@ def run_thread_cam(rs_cam, which_cam, ready_event, failure_event, stop_event):
     consecutive_failures = 0
     while not stop_event.is_set():
         try:
-            if which_cam == 1 or which_cam == 2:
-                image_cam, _ = rs_cam.read()
-                image_cam = image_cam[:, :, ::-1]
-            elif which_cam == 0:
-                image_top_src, _ = rs_cam.read()
-                image_top_src = image_top_src[150:420, 220:480, ::-1]
-                image_cam = cv2.resize(image_top_src, (640, 480))
+            # Driver supplies RGB with configured orientation. Preserve all
+            # native pixels; OpenCV display/JPEG encoding expects BGR.
+            rgb, _ = rs_cam.read()
+            image_cam = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
+            received = time.perf_counter()
             encoded, jpeg_image = cv2.imencode('.jpg', image_cam, encode_param)
             if not encoded:
                 raise RuntimeError(f"camera {which_cam} JPEG encoding failed")
             img_list[which_cam] = image_cam
             jpeg_list[which_cam] = jpeg_image.tobytes()
+            act_cameras.publish(which_cam, jpeg_image.tobytes(), received)
             ready_event.set()
             consecutive_failures = 0
         except RuntimeError as exc:
@@ -509,19 +531,19 @@ def get_robot_type(robot_ip):
         return None
 
 def check_firmware_version():
-    left_version = get_firmware_version_satisfied("192.168.5.1")
-    right_version = get_firmware_version_satisfied("192.168.5.2")
+    left_version = get_firmware_version_satisfied("192.168.5.2")
+    right_version = get_firmware_version_satisfied("192.168.5.1")
     if left_version[1] < 3581 or left_version[1]>=4000:
-        print("[ERROR]Left hand error[192.168.5.1]:firmware version requires V3 and must >=3.5.8.1 (found: %s),please check and update"%left_version[1])
+        print("[ERROR]LEFT Nova error[192.168.5.2]:firmware version requires V3 and must >=3.5.8.1 (found: %s),please check and update"%left_version[1])
         return False
     if right_version[1] < 3581 or right_version[1]>=4000:
-        print("[ERROR]Right hand error[192.168.5.1]:firmware version requires V3 and must >=3.5.8.1 (found: {%s}),please check and update"% right_version[1])
+        print("[ERROR]RIGHT Nova error[192.168.5.1]:firmware version requires V3 and must >=3.5.8.1 (found: {%s}),please check and update"% right_version[1])
         return False
     return True
 
 def main(args):
     # create dataset file path
-    save_dir = args.save_data_path+args.project_name+"/collect_data"
+    save_dir = str(Path(args.save_data_path) / args.project_name / "collect_data")
     mk_dir(save_dir)
     record_queue_size = int(os.environ.get("DOBOT_RECORD_QUEUE_SIZE", "8"))
     record_writer = BoundedAsyncWriter(
@@ -572,6 +594,8 @@ def main(args):
     env.set_do_status([3, 0])
     robot_pose_init(env)
     obs = env.get_obs()
+    if os.environ.get("DOBOT_ACT_RECORDING") == "1" and "dataset_joint_positions" not in obs:
+        raise RuntimeError("ACT recording requires DOBOT_ACT_RECORDING=1 in terminal A; restart A and B")
     start_servo = False
     curr_light = "dark"
     print("robot init success....")
@@ -595,7 +619,8 @@ def main(args):
     print("-------------------------Ok, let's start------------------------")
     idx = 0
     record_source_index = 0
-    last_record_queue_warning = 0.0
+    active_record_episode = None
+    active_record_failed = False
     safe_limit = 0
     total_time = 0.04
     perf_window_start = time.monotonic()
@@ -642,6 +667,14 @@ def main(args):
 
     while 1:
         tic = time.monotonic()
+        if active_record_episode is not None and what_to_do[0, 2] != 1:
+            try:
+                if not record_writer.submit(dict(episode_dir=active_record_episode, samples=idx,
+                                                 closed=True, aborted=active_record_failed, closed_at=time.perf_counter())):
+                    runtime_log("RECORD_CLOSE_DROPPED", episode_dir=active_record_episode)
+            except RuntimeError as exc:
+                runtime_log("RECORD_WRITER_FAILURE", error=str(exc))
+            active_record_episode = None
         require_button_monitor_healthy(thread_button, button_failure_event, button_errors)
 
         if camera_failure_event.is_set():
@@ -792,8 +825,8 @@ def main(args):
                 master_now, obs["joint_positions"], last_action, cycle_elapsed)
             for side in aligned_sides:
                 runtime_log("ALIGN_DONE", nova_side=side, follow_speed_rad_s=max_servoj_speed_rad_s)
-            # Gripper flags are in master/same-side order; alignment is Nova/crossed order.
-            aligned_gripper_flags = np.asarray(gripper_flags) * planner.aligned[::-1]
+            # Gripper enables and alignment now share the Nova vector order.
+            aligned_gripper_flags = np.asarray(gripper_flags) * planner.aligned
             action = apply_same_side_gripper_targets(action, master_now, last_action, aligned_gripper_flags)
             action, limited_sides = limit_tcp_descent(
                 action, last_action, cycle_elapsed, robot_type, flag_in)
@@ -861,60 +894,42 @@ def main(args):
             if dev_what_to_do[0, 2] == 1 and recording_enabled:
                 idx = 0
                 record_source_index = 0
+                active_record_episode = os.path.join(save_dir, str(dt_time[0]))
+                active_record_failed = False
                 curr_light = set_light(env, "green", 1)
                 runtime_log("RECORD_START", episode_dir=os.path.join(save_dir, str(dt_time[0])),
                             cameras=list(camera_settings.serials))
             elif dev_what_to_do[0, 2] == -1 and recording_enabled:
+                if active_record_episode is not None:
+                    try:
+                        record_writer.submit(dict(episode_dir=active_record_episode, samples=idx,
+                                                  closed=True, aborted=active_record_failed, closed_at=time.perf_counter()))
+                    except RuntimeError as exc:
+                        runtime_log("RECORD_WRITER_FAILURE", error=str(exc))
+                    active_record_episode = None
                 curr_light = set_light(env, "yellow", 1)
                 runtime_log("RECORD_STOP", samples=idx, dropped=record_writer.dropped_count)
 
-            # Preserve the behavior-cloning pairing used by the original
-            # collector: pre-command observation obs_t with action_t. The
-            # queue callback performs disk I/O later, off the control thread.
+            # Freeze pre-command observations and camera packet; commit only
+            # after env.step returns, so failed/unknown sends cannot enter ACT.
+            pending_sample = None
             if what_to_do[0, 2] == 1 and recording_enabled:
-                capture_time = time.monotonic()
-
-                def _snapshot_recording():
-                    observations = {
-                        key: np.asarray(value).copy()
-                        for key, value in obs.items()
-                    }
-                    observations["_teleop_capture_monotonic_s"] = np.asarray(
-                        capture_time
-                    )
-                    observations["_teleop_source_index"] = np.asarray(
-                        record_source_index
-                    )
-                    observations["_teleop_dropped_before"] = np.asarray(
-                        record_writer.dropped_count
-                    )
-                    return RecordingSample(
-                        episode_dir=os.path.join(save_dir, str(dt_time[0])),
-                        index=idx,
-                        images=tuple(jpeg_list[i] for i in active_camera_indices),
-                        observations=observations,
-                        action=np.asarray(action).copy(),
-                        camera_names=tuple(camera_settings.serials),
-                    )
-
-                try:
-                    submitted = record_writer.submit_factory(_snapshot_recording)
-                except RuntimeError as exc:
-                    what_to_do[:, 2] = 0
-                    runtime_log("RECORD_WRITER_FAILURE", error=str(exc))
-                else:
-                    record_source_index += 1
-                    if submitted:
-                        idx += 1
-                    else:
-                        now = time.monotonic()
-                        if now - last_record_queue_warning >= 1.0:
-                            runtime_log(
-                                "RECORD_QUEUE_FULL",
-                                dropped=record_writer.dropped_count,
-                                queue_size=record_queue_size,
-                            )
-                            last_record_queue_warning = now
+                frames = act_cameras.snapshot(active_camera_indices)
+                capture_time = time.perf_counter()
+                observations = {key: np.asarray(value).copy() for key, value in obs.items()}
+                if os.environ.get("DOBOT_ACT_RECORDING") == "1":
+                    if "dataset_joint_positions" not in obs:
+                        raise RuntimeError("ACT mode requires DOBOT_ACT_RECORDING=1 in terminal A; restart A and B")
+                    observations = enrich_observation(obs, frames, flag_in, aligned_gripper_flags, capture_time)
+                    observations["_act_requested_action"] = master_now.copy()
+                observations["_teleop_capture_monotonic_s"] = np.asarray(capture_time)
+                observations["_teleop_source_index"] = np.asarray(record_source_index)
+                observations["_teleop_dropped_before"] = np.asarray(record_writer.dropped_count)
+                pending_sample = RecordingSample(
+                    episode_dir=os.path.join(save_dir, str(dt_time[0])), index=idx,
+                    images=tuple(f[0] for f in frames), observations=observations,
+                    action=np.asarray(action).copy(), camera_names=tuple(camera_settings.serials))
+                record_source_index += 1
 
             # Outside the ServoJ recovery handler: a dead button monitor is
             # fatal, and must not be swallowed and retried next cycle.
@@ -924,7 +939,19 @@ def main(args):
                 obs = env.step(action, flag_in, aligned_gripper_flags)
                 command_interval.committed(command_time)
                 runtime_log("ENV_STEP_OK", action=action, flags=flag_in.copy())
+                if pending_sample is not None:
+                    pending_sample.observations["_act_send_ok"] = np.asarray(True)
+                    pending_sample.observations["_act_send_end"] = np.asarray(time.perf_counter())
+                    try:
+                        if record_writer.submit(pending_sample):
+                            idx += 1
+                        else:
+                            runtime_log("RECORD_QUEUE_FULL", dropped=record_writer.dropped_count)
+                    except RuntimeError as exc:
+                        what_to_do[:, 2] = 0
+                        runtime_log("RECORD_WRITER_FAILURE", error=str(exc))
             except Exception as exc:
+                active_record_failed = True
                 runtime_log(
                     "SERVO_FAILURE",
                     error=f"{type(exc).__name__}: {exc}",
@@ -932,7 +959,10 @@ def main(args):
                     last_action=last_action.copy(),
                     flags=flag_in.copy(),
                 )
-                set_light(env, "red", 1)
+                try:
+                    set_light(env, "red", 1)
+                except Exception as light_exc:
+                    runtime_log("RECOVERY_LIGHT_FAILED", error=f"{type(light_exc).__name__}: {light_exc}")
                 for hand in range(2):
                     agent.set_torque(hand, True)
                 what_to_do[:, 1] = 0

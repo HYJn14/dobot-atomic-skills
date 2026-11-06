@@ -7,7 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 from scripts.function_util import wait_period, log_write
-from task_skills.layout import physical_nova_home_degrees
+from task_skills.layout import TELEOP_NOVA_SIDES, physical_nova_home_degrees
 
 
 def set_light(env, which_color, which_status):
@@ -76,7 +76,7 @@ def load_ini_data_gripper():
 
 # robot init move
 _SAFE_POSE_INIT_ENV = "DOBOT_ALLOW_SAFE_POSE_INIT"
-_SAFE_POSE_INIT_STEP_RAD = float(os.environ.get("DOBOT_SAFE_POSE_STEP_RAD", "0.02"))
+_SAFE_POSE_INIT_STEP_RAD = float(os.environ.get("DOBOT_SAFE_POSE_STEP_RAD", "0.008"))
 _SAFE_POSE_INIT_PERIOD_S = float(os.environ.get("DOBOT_SAFE_POSE_PERIOD_S", "0.05"))
 _SAFE_POSE_INIT_SERVO_T_S = float(os.environ.get("DOBOT_SAFE_POSE_SERVO_T_S", "0.05"))
 
@@ -133,8 +133,8 @@ def robot_pose_init(env):
     pose check that aborts before any initialization motion.
     """
     reset_1 = np.deg2rad([
-        *physical_nova_home_degrees("left"), 0,
-        *physical_nova_home_degrees("right"), 0,
+        *physical_nova_home_degrees(TELEOP_NOVA_SIDES[0]), 0,
+        *physical_nova_home_degrees(TELEOP_NOVA_SIDES[1]), 0,
     ])
     reset_2 = reset_1.copy()
 
@@ -177,24 +177,16 @@ def obs_action_check(env, agent):
         return 1, action
 
 
-# Master-to-Nova channel conversion.
-# The requested physical wiring is crossed: left master -> right Nova and
-# right master -> left Nova. Their verified startup poses already match in
-# this crossed pairing, so no additional sign inversion is applied here.
+# Master-to-Nova conversion: HAND_LEFT, HAND_RIGHT -> RIGHT .1, LEFT .2.
+# Each calibrated seven-entry half (six joints + gripper) is swapped once.
 
 
 def master_to_nova_action(action):
-    """Convert master order to crossed Nova target order.
+    """Map config master order to the calibrated Nova vector order.
 
-    Master order: HAND_LEFT (COM6), HAND_RIGHT (COM5).
-    Nova target order: left Nova, right Nova.
-    Configured routing: HAND_RIGHT -> left Nova and
-    HAND_LEFT -> right Nova. Config labels are NOT physical side evidence.
-    Gripper entries stay normalized [0, 1].
-    Configured reference poses match in this crossed pairing (HAND_LEFT
-    and right Nova both start at ~[-90,0,-90,0,+90,+90] deg; right master and
-    left Nova both start at ~[+90,0,+90,0,-90,-90] deg), so no sign inversion
-    is applied here. A direct straight-through mapping would flip J3/J5/J6.
+    Input: HAND_LEFT (COM6), HAND_RIGHT (COM5).
+    Output: RIGHT Nova .1 <- HAND_RIGHT, LEFT Nova .2 <- HAND_LEFT.
+    Keep calibrated absolute joints and normalized [0, 1] gripper values.
     """
     action = np.asarray(action, dtype=float).copy()
     if action.shape != (14,):
@@ -203,8 +195,7 @@ def master_to_nova_action(action):
     master_left = action[:7].copy()
     master_right = action[7:14].copy()
 
-    # Output is target order: left Nova <- right master,
-    # right Nova <- left master.
+    # Output order is physical RIGHT .1, LEFT .2.
     return np.concatenate([master_right, master_left])
 
 
@@ -217,11 +208,11 @@ def master_to_nova_flags(master_flags):
 
 
 def master_to_nova_gripper_flags(master_flags):
-    """Keep gripper flags in config-channel order; physical routing needs verification."""
+    """Route gripper enables to the same Nova slot as each master's arm."""
     flags = np.asarray(master_flags).copy()
     if flags.shape != (2,):
         raise ValueError(f"Expected two master flags, got shape {flags.shape}")
-    return flags
+    return flags[::-1]
 
 
 def apply_same_side_gripper_targets(
@@ -230,7 +221,7 @@ def apply_same_side_gripper_targets(
     last_action,
     gripper_flags,
 ):
-    """Apply config-channel gripper mapping; physical placement is verified onsite."""
+    """Use the gripper target already mapped to each Nova slot."""
     result = np.asarray(action, dtype=float).copy()
     crossed_master_action = np.asarray(crossed_master_action, dtype=float)
     last_action = np.asarray(last_action, dtype=float)
@@ -242,11 +233,11 @@ def apply_same_side_gripper_targets(
     if flags.shape != (2,):
         raise ValueError(f"Expected two gripper flags, got shape {flags.shape}")
 
-    # crossed_master_action[13] is the HAND_LEFT master gripper;
-    # crossed_master_action[6] is the HAND_RIGHT master gripper.
+    # master_to_nova_action already swapped both complete seven-entry halves.
+    # A second gripper-only swap would send each target to the opposite arm.
     for target_index, source_index, enabled in (
-        (6, 13, bool(flags[0])),
-        (13, 6, bool(flags[1])),
+        (6, 6, bool(flags[0])),
+        (13, 13, bool(flags[1])),
     ):
         result[target_index] = (
             np.clip(crossed_master_action[source_index], 0.0, 1.0)

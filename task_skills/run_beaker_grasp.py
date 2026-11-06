@@ -635,7 +635,7 @@ class R10DobotHardwareAdapter(R09DobotHardwareAdapter):
 
 
 def create_live_adapter(settle_timeout: float = 180.0) -> R10DobotHardwareAdapter:
-    """Use only the right arm and its existing GRIPPER_LEFT binding."""
+    """Use only physical RIGHT (.1) and its GRIPPER_RIGHT binding."""
     return R10DobotHardwareAdapter.from_live((R09_ARM,), settle_timeout=settle_timeout)
 
 

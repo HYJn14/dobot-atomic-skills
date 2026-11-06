@@ -1,3 +1,5 @@
+> 2026-11-06 当前标准：RIGHT 右从臂 192.168.5.1 / GRIPPER_RIGHT / COM4 / ID22；LEFT 左从臂 192.168.5.2 / GRIPPER_LEFT / COM3 / ID21。下文旧绑定和侧别为历史记录，当前操作见主操作手册；旧示教路径需按新绑定复核。
+
 # R09 beaker approach demo
 
 This dedicated runner builds a local `AtomicExecutionGraph` (schema `2.0`)
