@@ -12,6 +12,65 @@ from experiments import run_control as control
 
 
 class CameraTests(unittest.TestCase):
+    def test_preview_initialization_precedes_master_construction(self):
+        order = []
+        settings = CameraSettings({'top':'123'},15)
+        def start(settings):
+            order.append('cameras')
+            return {}, threading.Event(), threading.Event(), Mock()
+        def hands():
+            order.append('hands')
+            raise RuntimeError('stop before constructing hardware')
+        with patch.object(control,'mk_dir'), patch.object(control,'BoundedAsyncWriter'), patch.object(control.atexit,'register'), patch.object(control,'load_camera_settings',return_value=settings), patch.object(control,'start_configured_cameras',side_effect=start), patch.object(control,'initialize_camera_preview',side_effect=lambda indices:order.append('preview')), patch.object(control,'load_ini_data_hands',side_effect=hands), patch.dict('os.environ',{'DOBOT_ACT_RECORDING':'0'}):
+            with self.assertRaisesRegex(RuntimeError,'stop before constructing hardware'):
+                control.main(control.Args(show_img=True))
+        self.assertEqual(order,['cameras','preview','hands'])
+
+    def test_preview_warmup_draws_same_window_and_all_views(self):
+        with patch.object(control.cv2,'namedWindow') as window, patch.object(control.cv2,'imshow') as show, patch.object(control.cv2,'waitKey') as wait:
+            control.initialize_camera_preview([0,1,2])
+            window.assert_called_once_with('0',cv2.WINDOW_AUTOSIZE)
+            self.assertEqual(show.call_args.args[0],'0')
+            self.assertEqual(show.call_args.args[1].shape,(480,1920,3))
+            self.assertEqual(show.call_args.args[1].dtype,np.uint8)
+            wait.assert_called_once_with(1)
+
+    def test_rgb_only_driver_returns_no_depth_and_keeps_rotation(self):
+        from dobot_control.cameras.realsense_camera import RealSenseCamera
+        camera = RealSenseCamera.__new__(RealSenseCamera)
+        camera._flip = True
+        camera._enable_depth = False
+        bgr = np.arange(4*6*3, dtype=np.uint8).reshape(4,6,3)
+        frames = Mock()
+        frames.get_color_frame.return_value.get_data.return_value = bgr
+        camera._pipeline = Mock()
+        camera._pipeline.wait_for_frames.return_value = frames
+        rgb, depth = camera.read()
+        self.assertIsNone(depth)
+        frames.get_depth_frame.assert_not_called()
+        np.testing.assert_array_equal(rgb, bgr[::-1,::-1,::-1])
+
+    def test_depth_stream_switch_preserves_driver_default(self):
+        import pyrealsense2 as rs
+        from dobot_control.cameras.realsense_camera import RealSenseCamera
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), patch.object(rs,'pipeline'), patch.object(rs,'config') as config, patch.object(RealSenseCamera,'read'):
+                camera = RealSenseCamera('123', fps=15, enable_depth=enabled)
+                streams = [c.args[0] for c in config.return_value.enable_stream.call_args_list]
+                self.assertIn(rs.stream.color, streams)
+                self.assertEqual(rs.stream.depth in streams, enabled)
+                camera.close()
+
+    def test_rgb_only_preview_uses_configured_switch(self):
+        preview = importlib.import_module('scripts.5_camera_read')
+        settings = CameraSettings({'top':'123'},15,depth_enabled=False)
+        camera = Mock()
+        camera.read.return_value = (np.zeros((480,640,3),np.uint8),None)
+        with patch.object(preview,'load_camera_settings',return_value=settings), patch.object(preview,'RealSenseCamera',return_value=camera) as create, patch('sys.argv',['camera','--frames','1','--no-display']):
+            preview.main()
+            create.assert_called_once_with(device_id='123',flip=True,fps=15,enable_depth=False)
+            camera.close.assert_called_once()
+
     def test_full_frame_corners_survive_recording_encoding(self):
         rgb = np.zeros((480,640,3), np.uint8)
         colors = [(240,20,20),(20,240,20),(20,20,240),(240,240,20)]

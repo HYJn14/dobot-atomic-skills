@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from dobot_control.act_recording import atomic_json
+from dobot_control.act_recording import atomic_json, validate_camera_packet
 
 
 def inspect_episode(episode, fps=15.):
@@ -25,6 +25,15 @@ def inspect_episode(episode, fps=15.):
     if not closed.get('closed') or closed.get('samples') != len(paths) or closed.get('aborted'):
         errors.append('episode not cleanly closed or saved sample count mismatch')
     names = meta.get('camera_names', ['top'])
+    if not names or len(set(names)) != len(names) or any(n not in ('top','left','right') for n in names):
+        errors.append('invalid camera names')
+        names = []
+    if meta.get('task') == 'test_tube_insert':
+        supported = (['top','left'], ['top','left','right'])
+        if names not in supported or meta.get('required_camera_names') != names:
+            errors.append('tube insertion camera profile mismatch')
+        if meta.get('max_camera_skew_s') != .10:
+            errors.append('tube insertion requires protocol camera skew limit 0.10s')
     for path in paths:
         try:
             with path.open('rb') as f:
@@ -49,16 +58,28 @@ def inspect_episode(episode, fps=15.):
                     raise ValueError(f'{key} stale/future: age={age.tolist()}')
             if not np.asarray(row['_act_gripper_valid']).all() or not bool(row['_act_send_ok']):
                 raise ValueError('feedback/send invalid')
-            if np.asarray(row['_act_arm_flags']).shape != (2,) or not np.asarray(row['_act_arm_flags']).all():
-                raise ValueError('both arms must be enabled for task recording')
-            if np.asarray(row['_act_gripper_flags']).shape != (2,) or not np.asarray(row['_act_gripper_flags']).all():
-                raise ValueError('both grippers must be enabled for task recording')
+            for key, requirement in (('_act_arm_flags','required_arm_flags'),
+                                     ('_act_gripper_flags','required_gripper_flags')):
+                flags = np.asarray(row[key])
+                required = np.asarray(meta.get(requirement, [True, True]))
+                if (flags.shape != (2,) or required.shape != (2,)
+                        or not required[1] or not np.isin(flags, [0,1]).all()
+                        or not np.isin(required, [0,1]).all()
+                        or not flags[required.astype(bool)].all()):
+                    raise ValueError(f'{key}: required arm/gripper must be enabled')
+            if '_teleop_camera_names' in row and list(row['_teleop_camera_names']) != names:
+                raise ValueError('row camera names differ from episode')
+            validate_camera_packet(dict(meta, camera_names=names),
+                [(b'present', t0, fid) for t0, fid in zip(camera, row['_act_camera_id'])], t)
             if np.asarray(row['_act_camera_id']).shape != (len(names),):
                 raise ValueError('invalid camera frame IDs')
             if not np.isfinite(t) or not t <= float(row['_act_send_end']) <= t + .5:
                 raise ValueError('invalid send timing')
             for name in names:
-                image = cv2.imread(str(episode / f'{name}Img' / f'{path.stem}.jpg'))
+                image_path = episode / f'{name}Img' / f'{path.stem}.jpg'
+                if not image_path.is_file():
+                    raise ValueError(f'missing/invalid image {name}')
+                image = cv2.imread(str(image_path))
                 if image is None or image.shape != (480, 640, 3):
                     raise ValueError(f'missing/invalid image {name}')
             rows.append((int(path.stem), t, row))
@@ -87,6 +108,9 @@ def inspect_episode(episode, fps=15.):
         q = np.array([r[2]['joint_positions'] for r in rows])
         telemetry['gripper_range'] = np.ptp(q[:, [6, 13]], axis=0).tolist()
         telemetry['camera_unique_frames'] = [len(set(int(r[2]['_act_camera_id'][i]) for r in rows)) for i in range(len(names))]
+        camera_times = np.array([r[2]['_act_camera_time'] for r in rows])
+        telemetry['camera_age_p50_p95_max'] = np.quantile(times[:,None] - camera_times, [.5,.95,1], axis=0).T.tolist()
+        telemetry['camera_skew_p50_p95_max'] = np.quantile(np.ptp(camera_times, axis=1), [.5,.95,1]).tolist()
         if len(times) > 1:
             telemetry['command_interval_p50_p95_max'] = np.quantile(np.diff(times), [.5, .95, 1]).tolist()
     report = dict(episode=episode.name, samples=len(paths), valid_samples=len(rows),
@@ -125,6 +149,7 @@ def convert_episode(episode, destination, fps=15.):
                               action_alignment='pre_command_observation_same_row_action',
                               source_episode=Path(episode).name,
                               metadata_json=json.dumps(meta, ensure_ascii=False))
+            root.attrs['camera_names'] = json.dumps(meta['camera_names'])
             for key, value in [('observations/qpos', qpos), ('observations/qvel', velocity),
                                ('action', actions), ('timestamp', grid - grid[0]),
                                ('source_index', np.array([r[0] for r in data]))]:
@@ -154,8 +179,18 @@ def load_act_window(path, start=0, chunk_size=30):
         action = np.zeros((chunk_size, 14), np.float32)
         action[:count] = root['action'][start:start + count]
         mask = np.arange(chunk_size) >= count
+        if 'camera_names' in root.attrs:
+            names = json.loads(root.attrs['camera_names'])
+        else:
+            names = json.loads(root.attrs.get('metadata_json', '{}')).get('camera_names')
+            if names is None:
+                import warnings
+                warnings.warn('Legacy file has no camera order; using sorted names')
+                names = sorted(root['observations/images'])
+        if not names or len(set(names)) != len(names) or set(names) != set(root['observations/images']):
+            raise ValueError('invalid HDF5 camera order')
         images = np.stack([root[f'observations/images/{name}'][start]
-                           for name in sorted(root['observations/images'])])
+                           for name in names])
         return images, root['observations/qpos'][start], action, mask
 
 
@@ -167,7 +202,7 @@ def main():
         p.add_argument('path', type=Path)
         if name == 'label':
             p.add_argument('--status', choices=['success', 'failure', 'unreviewed'], required=True)
-            p.add_argument('--note', required=True, help='bottle type, tightness, outcome and recovery')
+            p.add_argument('--note', required=True, help='fixture, object, insertion depth, release/withdrawal outcome and recovery')
         else:
             p.add_argument('--report', type=Path)
             p.add_argument('--fps', type=float, default=15.)
@@ -187,18 +222,26 @@ def main():
         if args.output.exists():
             raise FileExistsError(args.output)
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        writer = cv2.VideoWriter(str(args.output), cv2.VideoWriter_fourcc(*'mp4v'), args.fps, (640,480))
+        metadata_path = args.path/'episode.json'
+        metadata = json.loads(metadata_path.read_text(encoding='utf-8')) if metadata_path.exists() else {}
+        names = metadata.get('camera_names', ['top'])
+        if not names or len(set(names)) != len(names) or any(n not in ('top','left','right') for n in names):
+            raise ValueError('invalid preview camera names')
+        writer = cv2.VideoWriter(str(args.output), cv2.VideoWriter_fourcc(*'mp4v'), args.fps, (640*len(names),480))
         if not writer.isOpened():
             raise RuntimeError('cannot open MP4 writer')
         try:
             for t in np.arange(times[0], times[-1], 1/args.fps):
                 i = np.searchsorted(times, t, side='right')-1
-                image = cv2.imread(str(args.path/'topImg'/f'{paths[i].stem}.jpg'))
-                if image is None:
-                    raise ValueError(f'missing image: {paths[i].stem}')
-                cv2.putText(image, f'{t-times[0]:.2f}s sample={paths[i].stem}', (10,25),
-                            cv2.FONT_HERSHEY_SIMPLEX, .6, (0,255,0), 1)
-                writer.write(image)
+                images = []
+                for name in names:
+                    image = cv2.imread(str(args.path/f'{name}Img'/f'{paths[i].stem}.jpg'))
+                    if image is None or image.shape != (480,640,3):
+                        raise ValueError(f'missing/invalid image: {name}/{paths[i].stem}')
+                    cv2.putText(image, f'{name} {t-times[0]:.2f}s sample={paths[i].stem}', (10,25),
+                                cv2.FONT_HERSHEY_SIMPLEX, .6, (0,255,0), 1)
+                    images.append(image)
+                writer.write(np.concatenate(images, axis=1))
         finally:
             writer.release()
         print(args.output)
@@ -223,7 +266,10 @@ def main():
             if entries and any(meta.get(k) != entries[0]['metadata'].get(k)
                                for k in ('config_sha256', 'camera_names', 'channel_order',
                                          'top_crop', 'top_flip', 'image_pipeline_version',
-                                         'hardware_layout_version', 'gripper_ports')):
+                                         'hardware_layout_version', 'gripper_ports', 'task', 'fixture',
+                                         'task_protocol_version', 'camera_serials', 'camera_flips',
+                                         'camera_positions', 'camera_fps', 'camera_depth_enabled', 'max_camera_skew_s',
+                                         'required_camera_names', 'required_arm_flags', 'required_gripper_flags')):
                 raise ValueError('incompatible configuration/camera/channel order/image geometry; export separate dataset versions')
             name = f'episode_{len(entries)}.hdf5' 
             convert_episode(ep, args.output / name, args.fps)
@@ -241,6 +287,7 @@ def main():
         nval = max(1, round(len(ids) * .2)) if len(ids) >= 2 else 0
         atomic_json(args.output / 'splits.json', dict(train=ids[nval:], validation=ids[:nval], seed=0))
         atomic_json(args.output / 'dataset_manifest.json', dict(schema=2, fps=args.fps, episodes=entries,
+                    camera_names=entries[0]['metadata']['camera_names'] if entries else [],
                     action_alignment='same_row_no_shift', image_color='RGB', qvel='finite_difference',
                     normalization='compute only over train episodes; floor std at 0.01'))
         print(f'Exported {len(entries)} episodes to {args.output}')

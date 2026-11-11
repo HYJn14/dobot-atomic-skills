@@ -417,7 +417,7 @@ $calErrors | Export-Csv -LiteralPath (Join-Path $calDir ($calSection + '-referen
 
 home 数值继续跟随原 IP，修正侧别名称不交换两臂目标。`start_joints` 中的 ±1.57 rad 是参考近似值，不改变上述 home。
 
-`robot_pose_init()` 默认只检查姿态；六轴差异大于 `1e-6 rad` 时，未显式授权会以 `Safe stop before pose motion` 退出。该开关不影响服务使能或夹爪启动动作。可选授权见 9.3。
+`robot_pose_init()` 默认只检查姿态；任一机械臂关节偏差超过 `0.1°`（约0.001745 rad）时，未显式授权会以 `Safe stop before pose motion` 退出。该开关不影响服务使能或夹爪启动动作。容差内不发送归位动作，夹爪开度差异不参与判断；日志显示六位小数的角度差。可选授权见 9.3。
 
 服务构造时写入 `SetTool(1,0,0,197,0,0,0)` 并选用 Tool 1；必须与实际末端、负载和安装匹配。保护计算另外使用 FK 模型、约 0.2 m 工具长度及夹爪模型，不等于经标定的实际 TCP 或完整碰撞模型。普通遥操的夹爪控制状态沿用指令值；ACT 模式另采集真实位置缓存及其时间、有效性，写入 dataset_joint_positions。
 
@@ -630,3 +630,11 @@ Remove-Item Env:DOBOT_ALLOW_SAFE_POSE_INIT -ErrorAction SilentlyContinue
 | 单相机录制 | 离线真实写盘/读回已过；现场登记 B 首次开始、再次停止、JPG/PKL 配对及退出结果 |
 | 停止与设备锁 | 确认静止、主手支撑/锁定、控制器状态和旧锁所有者 |
 | 本次文档校验 | 对照源码、INI、脚本路径、文档命令与 Markdown 结构；未启动 A/B、采样或相机流 |
+
+### ACT 三相机试管采集（2026-11-06）
+
+当前 ACT 任务为桌面固定窄口杯、左臂插入试管后松爪并撤离，沿用双侧跟随与使能检查。腕部相机序列号尚需现场绑定；三路配置和新数据目录见 [ACT采集手册](manuals/ACT_DEMONSTRATION_COLLECTION.zh-CN.md)。普通遥操仍按 CAMERA.enabled 打开相机；新 ACT 任务只接收 top/left/right 三路齐全的记录。
+
+### 当前ACT单左臂两视角配置（2026-11-10）
+
+本轮只启用top/left、禁用right相机；任务active_arms=left允许只开启左臂/左夹爪跟随，双臂控制及14维数据保留。ACT原始录制节拍最高15Hz、默认64条有界样本缓冲，结束标记按FIFO可靠提交。使用新项目tube_insert_cup_2cam_v1。完整命令和验收步骤以ACT采集手册当前版为准。

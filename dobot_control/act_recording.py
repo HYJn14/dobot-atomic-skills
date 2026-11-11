@@ -54,6 +54,27 @@ class CameraSnapshots:
             return tuple(self.frames[i] for i in indices)
 
 
+class RecordingCadence:
+    """Limit disk sampling without sleeping or changing robot control rate."""
+    def __init__(self, fps=15.):
+        if not np.isfinite(fps) or fps <= 0:
+            raise ValueError('recording fps must be positive')
+        self.period = 1. / fps
+        self.reset()
+
+    def reset(self):
+        self.next_time = None
+
+    def ready(self, now):
+        return self.next_time is None or now + 1e-9 >= self.next_time
+
+    def advance(self, now):
+        if self.next_time is None:
+            self.next_time = now + self.period
+        else:
+            self.next_time += max(1, int((now - self.next_time) / self.period) + 1) * self.period
+
+
 def atomic_json(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,3 +94,25 @@ def enrich_observation(obs, frames, arm_flags, gripper_flags, command_time):
     result['_act_gripper_flags'] = np.asarray(gripper_flags).copy()
     result['_act_command_time'] = np.asarray(command_time)
     return result
+
+
+def validate_camera_packet(meta, frames, capture_time):
+    names = meta.get('camera_names', [])
+    if (not names or len(set(names)) != len(names)
+            or any(name not in ('top', 'left', 'right') for name in names)):
+        raise ValueError('invalid camera names')
+    required = meta.get('required_camera_names')
+    if required is not None and names != required:
+        raise ValueError(f'task requires camera order {required}')
+    if len(frames) != len(names) or any(not frame[0] for frame in frames):
+        raise ValueError('missing camera image')
+    times = np.asarray([frame[1] for frame in frames], dtype=float)
+    age = capture_time - times
+    if not np.isfinite(capture_time) or not np.isfinite(times).all() or np.any(age < 0) or np.any(age > .2):
+        raise ValueError('camera stale/future')
+    if 'max_camera_skew_s' in meta:
+        limit = float(meta['max_camera_skew_s'])
+        if not np.isfinite(limit) or not 0 < limit <= .2:
+            raise ValueError('invalid camera skew limit')
+        if np.ptp(times) > limit:
+            raise ValueError('camera skew exceeds limit')

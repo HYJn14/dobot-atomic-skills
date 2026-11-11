@@ -1,6 +1,6 @@
 """Validated selection of teleoperation cameras; no device access."""
 import configparser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 CAMERA_NAMES = ("top", "left", "right")
@@ -11,6 +11,8 @@ DEFAULT_PATH = Path(__file__).resolve().parents[2] / "scripts/dobot_config/dobot
 class CameraSettings:
     serials: dict
     fps: int
+    flips: dict = field(default_factory=lambda: {'top': True, 'left': False, 'right': True})
+    depth_enabled: bool = True
 
     @property
     def recording_enabled(self):
@@ -31,4 +33,7 @@ def load_camera_settings(path=DEFAULT_PATH):
     fps = config.getint("CAMERA", "fps", fallback=90)
     if fps not in (15, 30, 60, 90):
         raise ValueError("CAMERA.fps must be 15, 30, 60 or 90")
-    return CameraSettings(serials=serials, fps=fps)
+    flips = {name: config.getboolean('CAMERA', name + '_flip', fallback=name != 'left')
+             for name in CAMERA_NAMES}
+    return CameraSettings(serials=serials, fps=fps, flips=flips,
+                          depth_enabled=config.getboolean('CAMERA', 'depth_enabled', fallback=True))

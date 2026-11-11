@@ -76,6 +76,8 @@ def load_ini_data_gripper():
 
 # robot init move
 _SAFE_POSE_INIT_ENV = "DOBOT_ALLOW_SAFE_POSE_INIT"
+# Per-joint startup match tolerance, with only a floating-point roundoff margin.
+_SAFE_POSE_MATCH_TOL_RAD = np.deg2rad(0.1) + 1e-12
 _SAFE_POSE_INIT_STEP_RAD = float(os.environ.get("DOBOT_SAFE_POSE_STEP_RAD", "0.008"))
 _SAFE_POSE_INIT_PERIOD_S = float(os.environ.get("DOBOT_SAFE_POSE_PERIOD_S", "0.05"))
 _SAFE_POSE_INIT_SERVO_T_S = float(os.environ.get("DOBOT_SAFE_POSE_SERVO_T_S", "0.05"))
@@ -91,12 +93,13 @@ def _print_pose_check(curr_joints, target_joints, label):
     target_deg = np.rad2deg(target_arm)
     delta_deg = target_deg - curr_deg
     print(f"[POSE CHECK] {label}")
-    print("  current_arm_deg =", np.round(curr_deg, 2).tolist())
-    print("  target_arm_deg  =", np.round(target_deg, 2).tolist())
-    print("  delta_arm_deg   =", np.round(delta_deg, 2).tolist())
+    print("  current_arm_deg =", np.round(curr_deg, 4).tolist())
+    print("  target_arm_deg  =", np.round(target_deg, 4).tolist())
+    print("  delta_arm_deg   =", np.round(delta_deg, 6).tolist())
     print("  gripper_current =", np.round([curr_joints[6], curr_joints[13]], 4).tolist())
     print("  gripper_target  =", np.round([target_joints[6], target_joints[13]], 4).tolist())
-    print("  max_arm_delta_deg =", round(float(np.max(np.abs(delta_deg))), 2))
+    print("  max_arm_delta_deg =", round(float(np.max(np.abs(delta_deg))), 6))
+    print("  match_tolerance_deg = 0.1")
 
 
 def _safe_pose_segment(env, curr_joints, target_joints, label):
@@ -104,8 +107,8 @@ def _safe_pose_segment(env, curr_joints, target_joints, label):
     curr_arm = np.concatenate([curr_joints[:6], curr_joints[7:13]])
     target_arm = np.concatenate([target_joints[:6], target_joints[7:13]])
     max_delta = float(np.max(np.abs(curr_arm - target_arm)))
-    if max_delta <= 1e-6:
-        print(f"[SAFE POSE INIT] {label}: six-axis pose already matches; no motion sent.", flush=True)
+    if max_delta <= _SAFE_POSE_MATCH_TOL_RAD:
+        print(f"[SAFE POSE INIT] {label}: six-axis pose within 0.1 deg tolerance; no motion sent.", flush=True)
         return
     # Preserve the current gripper commands. Pose initialization must not
     # open/close either gripper as a side effect of arm interpolation.
@@ -145,8 +148,8 @@ def robot_pose_init(env):
     curr_arm = np.concatenate([curr_joints[:6], curr_joints[7:13]])
     target_arm = np.concatenate([reset_1[:6], reset_1[7:13]])
     max_arm_delta = float(np.max(np.abs(curr_arm - target_arm)))
-    if max_arm_delta <= 1e-6:
-        print("[SAFE POSE INIT] six-axis pose already matches target; no motion sent.", flush=True)
+    if max_arm_delta <= _SAFE_POSE_MATCH_TOL_RAD:
+        print("[SAFE POSE INIT] six-axis pose within 0.1 deg tolerance; no motion sent.", flush=True)
         return
 
     if os.environ.get(_SAFE_POSE_INIT_ENV) != "1":

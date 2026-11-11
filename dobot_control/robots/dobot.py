@@ -5,6 +5,7 @@ from dobot_control.robots.robot import Robot
 import os
 import struct
 import sys
+import re
 from scripts.manipulate_utils import load_ini_data_hands, load_ini_data_gripper
 from scripts.manipulate_utils import robot_pose_init, pose_check, dynamic_approach, obs_action_check, \
     servo_action_check, load_ini_data_hands, set_light, load_ini_data_camera
@@ -208,7 +209,7 @@ class DobotRobot(Robot):
         """
         assert not self.robot_is_err, f"{self.robot_ip}: error!"
         # log_write(str(self.robot_ip) + ": getpose_start")
-        robot_joints_angle = list(map(float, self.r_inter.GetAngle().split("{")[1].split("}")[0].split(",")))  # 单位：度�?
+        robot_joints_angle = self._read_dashboard_vector('GetAngle')
         robot_joints = [np.deg2rad(robot_joint) for robot_joint in robot_joints_angle]  # 单位：弧�?
         if self._use_gripper:
             gripper_pos = [1.0]
@@ -224,8 +225,24 @@ class DobotRobot(Robot):
             T: The current X Y Z rx ry rz state of the robot.
         """
         assert not self.robot_is_err, f"{self.robot_ip}: error!"
-        pos = list(map(float, self.r_inter.GetPose().split("{")[1].split("}")[0].split(",")))  # 单位：度数
+        pos = self._read_dashboard_vector('GetPose')
         return pos
+
+    def _read_dashboard_vector(self, command):
+        reply = getattr(self.r_inter, command)()
+        try:
+            match = re.fullmatch(r'\s*(-?\d+)\s*,\s*\{([^{}]*)\}\s*,\s*'
+                                 + re.escape(command) + r'\(\s*\)\s*;\s*', reply)
+            if match is None:
+                raise ValueError('malformed or mismatched reply')
+            if int(match[1]) != 0:
+                raise ValueError(f'controller status {match[1]}')
+            values = [float(part) for part in match[2].split(',')]
+            if len(values) != 6 or not np.isfinite(values).all():
+                raise ValueError('expected six finite values')
+            return values
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f'{self.robot_ip} {command} invalid response: {exc}; raw={reply!r}') from exc
 
     def command_joint_state(
         self,

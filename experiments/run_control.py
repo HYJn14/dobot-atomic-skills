@@ -21,7 +21,8 @@ from dobot_control.agents.dobot_agent import DobotAgent
 from dobot_control.cameras.realsense_camera import RealSenseCamera
 from dobot_control.cameras.settings import CAMERA_NAMES, load_camera_settings
 from dobot_control.async_writer import BoundedAsyncWriter
-from dobot_control.act_recording import CameraSnapshots, atomic_json, enrich_observation
+from dobot_control.act_recording import CameraSnapshots, atomic_json, enrich_observation, validate_camera_packet, RecordingCadence
+from dobot_control.act_task import load_act_task
 
 act_cameras = CameraSnapshots()
 from dobot_control.absolute_teleop import AbsoluteTeleopPlanner, CommandInterval, DEFAULT_FOLLOW_SPEED_RAD_S
@@ -87,6 +88,7 @@ class RecordingSample:
     observations: dict
     action: np.ndarray
     camera_names: tuple = CAMERA_NAMES
+    metadata: dict = None
 
 
 def write_recording_sample(sample):
@@ -125,6 +127,7 @@ def write_recording_sample(sample):
             "image_pipeline_version": 2, "image_size": [480, 640],
             "clock": "host perf_counter seconds; camera host receive time, not exposure time",
             "send_ok_semantics": "env.step RPC returned without exception; not controller arrival acknowledgement",
+            **(sample.metadata or {}),
         })
     save_frame(str(obs_dir) + os.sep, sample.index, observations, sample.action)
 
@@ -253,9 +256,9 @@ def run_thread_cam(rs_cam, which_cam, ready_event, failure_event, stop_event):
             # Driver supplies RGB with configured orientation. Preserve all
             # native pixels; OpenCV display/JPEG encoding expects BGR.
             rgb, _ = rs_cam.read()
+            received = time.perf_counter()
             image_cam = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-            received = time.perf_counter()
             encoded, jpeg_image = cv2.imencode('.jpg', image_cam, encode_param)
             if not encoded:
                 raise RuntimeError(f"camera {which_cam} JPEG encoding failed")
@@ -293,7 +296,9 @@ def start_configured_cameras(settings):
 
     try:
         for name, serial in settings.serials.items():
-            camera = RealSenseCamera(device_id=serial, flip=name != "left", fps=settings.fps)
+            depth_options = {} if settings.depth_enabled else {'enable_depth': False}
+            camera = RealSenseCamera(device_id=serial, flip=settings.flips[name], fps=settings.fps,
+                                     **depth_options)
             cameras[name] = camera
             ready = threading.Event()
             ready_events.append(ready)
@@ -313,6 +318,20 @@ def start_configured_cameras(settings):
         close()
         raise
     return threads, failure_event, stop_event, close
+
+
+def show_camera_preview(indices):
+    canvas = np.concatenate([np.asarray(img_list[i], dtype="uint8")
+                             for i in indices], axis=1)
+    cv2.imshow("0", canvas)
+    cv2.waitKey(1)
+
+
+def initialize_camera_preview(indices):
+    # Windows HighGUI's first window creation can hold the GIL >250 ms.
+    # Complete it before starting either master's serial reader/watchdog.
+    cv2.namedWindow("0", cv2.WINDOW_AUTOSIZE)
+    show_camera_preview(indices)
 
 
 def dh_transformation_matrix(theta, d, a, alpha):
@@ -545,7 +564,10 @@ def main(args):
     # create dataset file path
     save_dir = str(Path(args.save_data_path) / args.project_name / "collect_data")
     mk_dir(save_dir)
-    record_queue_size = int(os.environ.get("DOBOT_RECORD_QUEUE_SIZE", "8"))
+    # 64 samples at 15 Hz absorb brief Windows filesystem stalls (~4 s).
+    # Ordinary teleoperation keeps its original queue default.
+    default_queue_size = "64" if os.environ.get("DOBOT_ACT_RECORDING") == "1" else "8"
+    record_queue_size = int(os.environ.get("DOBOT_RECORD_QUEUE_SIZE", default_queue_size))
     record_writer = BoundedAsyncWriter(
         write_recording_sample,
         max_queue_size=record_queue_size,
@@ -554,12 +576,30 @@ def main(args):
 
     # camera init
     camera_settings = load_camera_settings()
+    recording_metadata = None
+    if os.environ.get("DOBOT_ACT_RECORDING") == "1":
+        import hashlib
+        config_path = Path(BASE_DIR) / "scripts/dobot_config/dobot_settings.ini"
+        recording_metadata = dict(load_act_task(config_path),
+            camera_names=list(camera_settings.serials),
+            camera_serials=dict(camera_settings.serials),
+            camera_flips=dict(camera_settings.flips),
+            camera_positions={"top": "overhead", "left": "physical left wrist", "right": "physical right wrist"},
+            record_fps=min(15, camera_settings.fps),
+            camera_fps=camera_settings.fps, camera_depth_enabled=camera_settings.depth_enabled,
+            image_pipeline_version=3,
+            config_sha256=hashlib.sha256(config_path.read_bytes()).hexdigest())
     camera_threads, camera_failure_event, camera_stop_event, close_cameras = start_configured_cameras(camera_settings)
     atexit.register(close_cameras)
     active_camera_indices = [CAMERA_NAMES.index(name) for name in camera_settings.serials]
     recording_enabled = camera_settings.recording_enabled
+    record_cadence = RecordingCadence(min(15, camera_settings.fps))
     print(f"camera thread init success: {list(camera_settings.serials)}, {camera_settings.fps} fps")
     print(f"[RECORD] Enabled views: {list(camera_settings.serials)}; output: {save_dir}")
+
+    if args.show_img:
+        initialize_camera_preview(active_camera_indices)
+        atexit.register(cv2.destroyAllWindows)
 
     # agent init
     hands_ini, hands_dict = load_ini_data_hands()
@@ -669,7 +709,7 @@ def main(args):
         tic = time.monotonic()
         if active_record_episode is not None and what_to_do[0, 2] != 1:
             try:
-                if not record_writer.submit(dict(episode_dir=active_record_episode, samples=idx,
+                if not record_writer.submit_final(dict(episode_dir=active_record_episode, samples=idx,
                                                  closed=True, aborted=active_record_failed, closed_at=time.perf_counter())):
                     runtime_log("RECORD_CLOSE_DROPPED", episode_dir=active_record_episode)
             except RuntimeError as exc:
@@ -894,6 +934,7 @@ def main(args):
             if dev_what_to_do[0, 2] == 1 and recording_enabled:
                 idx = 0
                 record_source_index = 0
+                record_cadence.reset()
                 active_record_episode = os.path.join(save_dir, str(dt_time[0]))
                 active_record_failed = False
                 curr_light = set_light(env, "green", 1)
@@ -902,7 +943,7 @@ def main(args):
             elif dev_what_to_do[0, 2] == -1 and recording_enabled:
                 if active_record_episode is not None:
                     try:
-                        record_writer.submit(dict(episode_dir=active_record_episode, samples=idx,
+                        record_writer.submit_final(dict(episode_dir=active_record_episode, samples=idx,
                                                   closed=True, aborted=active_record_failed, closed_at=time.perf_counter()))
                     except RuntimeError as exc:
                         runtime_log("RECORD_WRITER_FAILURE", error=str(exc))
@@ -913,9 +954,19 @@ def main(args):
             # Freeze pre-command observations and camera packet; commit only
             # after env.step returns, so failed/unknown sends cannot enter ACT.
             pending_sample = None
-            if what_to_do[0, 2] == 1 and recording_enabled:
+            if (what_to_do[0, 2] == 1 and recording_enabled
+                    and (recording_metadata is None or record_cadence.ready(time.perf_counter()))):
                 frames = act_cameras.snapshot(active_camera_indices)
                 capture_time = time.perf_counter()
+                packet_valid = True
+                if recording_metadata is not None:
+                    try:
+                        validate_camera_packet(recording_metadata, frames, capture_time)
+                    except ValueError as exc:
+                        packet_valid = False
+                        active_record_failed = True
+                        what_to_do[:, 2] = 0
+                        runtime_log("RECORD_CAMERA_INVALID", error=str(exc))
                 observations = {key: np.asarray(value).copy() for key, value in obs.items()}
                 if os.environ.get("DOBOT_ACT_RECORDING") == "1":
                     if "dataset_joint_positions" not in obs:
@@ -928,7 +979,10 @@ def main(args):
                 pending_sample = RecordingSample(
                     episode_dir=os.path.join(save_dir, str(dt_time[0])), index=idx,
                     images=tuple(f[0] for f in frames), observations=observations,
-                    action=np.asarray(action).copy(), camera_names=tuple(camera_settings.serials))
+                    action=np.asarray(action).copy(), camera_names=tuple(camera_settings.serials),
+                    metadata=recording_metadata)
+                if not packet_valid:
+                    pending_sample = None
                 record_source_index += 1
 
             # Outside the ServoJ recovery handler: a dead button monitor is
@@ -945,9 +999,14 @@ def main(args):
                     try:
                         if record_writer.submit(pending_sample):
                             idx += 1
+                            record_cadence.advance(capture_time)
                         else:
                             runtime_log("RECORD_QUEUE_FULL", dropped=record_writer.dropped_count)
+                            if recording_metadata is not None:
+                                active_record_failed = True
+                                what_to_do[:, 2] = 0
                     except RuntimeError as exc:
+                        active_record_failed = True
                         what_to_do[:, 2] = 0
                         runtime_log("RECORD_WRITER_FAILURE", error=str(exc))
             except Exception as exc:
@@ -985,10 +1044,7 @@ def main(args):
 
         # img show
         if args.show_img:
-            show_canvas = np.concatenate([np.asarray(img_list[i], dtype="uint8")
-                                          for i in active_camera_indices], axis=1)
-            cv2.imshow("0", show_canvas)
-            cv2.waitKey(1)
+            show_camera_preview(active_camera_indices)
 
         toc = time.monotonic()
         total_time = toc-tic

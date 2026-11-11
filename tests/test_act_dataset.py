@@ -20,7 +20,7 @@ from dobot_control.env import RobotEnv
 from scripts.act_training_adapter import training_stats
 
 
-def fixture(ep, count=24):
+def fixture(ep, count=24, names=("top",), metadata=None):
     from experiments.run_control import RecordingSample, write_recording_sample
     from dobot_control.async_writer import BoundedAsyncWriter
     writer = BoundedAsyncWriter(write_recording_sample, count + 2)
@@ -35,10 +35,15 @@ def fixture(ep, count=24):
         row = dict(joint_positions=q, joint_velocities=np.zeros(14), _act_schema=2,
                    _act_command_time=t, _teleop_capture_monotonic_s=t, _act_state_time=np.array([t-.01, t-.01]),
                    _act_gripper_time=np.array([t-.02, t-.02]), _act_gripper_valid=np.array([True, True]),
-                   _act_camera_time=np.array([t-.02]), _act_camera_id=np.array([i//2]),
+                   _act_camera_time=np.array([t-.02]*len(names)), _act_camera_id=np.array([i//2]*len(names)),
                    _act_arm_flags=np.ones(2), _act_gripper_flags=np.ones(2), _act_send_ok=True,
                    _act_send_end=t+.01, _teleop_source_index=i)
-        assert writer.submit(RecordingSample(str(ep), i, (jpeg,), row, a, ('top',)))
+        images = []
+        for c, name in enumerate(names):
+            view = np.zeros_like(image)
+            view[..., (2-c) % 3] = 200
+            images.append(cv2.imencode('.jpg', view)[1].tobytes())
+        assert writer.submit(RecordingSample(str(ep), i, tuple(images), row, a, names, metadata))
     assert writer.submit(dict(episode_dir=str(ep), samples=count, closed=True))
     writer.close()
     meta = json.loads((ep/'episode.json').read_text())
@@ -247,5 +252,85 @@ class ACTTelemetryTests(unittest.TestCase):
         value,t,valid=cache.snapshot()
         self.assertTrue(np.isnan(value));self.assertFalse(valid);self.assertEqual(t,0)
 
+
+
+class ThreeCameraTests(unittest.TestCase):
+    def setUp(self):
+        from dobot_control.act_task import load_act_task
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ep = self.root/'raw'/'1'
+        self.meta = dict(load_act_task(), task_protocol_version=1,
+                         required_camera_names=["top","left","right"],
+                         required_arm_flags=[True,True],required_gripper_flags=[True,True])
+        fixture(self.ep, names=('top','left','right'), metadata=self.meta)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def mutate(self, fn):
+        for path in (self.ep/'observation').glob('*.pkl'):
+            with path.open('rb') as f: row=pickle.load(f)
+            fn(row)
+            with path.open('wb') as f: pickle.dump(row,f)
+
+    def test_three_view_roundtrip_and_both_arm_values(self):
+        target=self.root/'episode.hdf5'
+        report=convert_episode(self.ep,target)
+        self.assertTrue(report['passed'])
+        images,q,actions,mask=load_act_window(target)
+        self.assertEqual(images.shape,(3,480,640,3))
+        for i in range(3):
+            self.assertGreater(images[i,100,100,i],190)
+        np.testing.assert_allclose(actions[0],q+.01,atol=1e-6)
+        self.assertEqual(q.shape,(14,))
+        self.assertGreater(q[1],0)  # right side is recorded, not zeroed
+        self.assertIn('camera_skew_p50_p95_max',report['telemetry'])
+
+    def test_camera_faults_and_enable_contract(self):
+        from dobot_control.act_recording import validate_camera_packet
+        meta=dict(self.meta,camera_names=['top','left','right'])
+        for frames in [((b'x',9.99,1),)*2,
+                       ((b'',9.99,1),)*3,
+                       ((b'x',10.01,1),)*3,
+                       ((b'x',9.7,1),)*3,
+                       ((b'x',9.85,1),(b'x',9.99,1),(b'x',9.99,1))]:
+            with self.subTest(frames=frames), self.assertRaises(ValueError):
+                validate_camera_packet(meta,frames,10.)
+        self.mutate(lambda r:r.update(_act_arm_flags=np.array([0,1])))
+        self.assertFalse(inspect_episode(self.ep)[0]['passed'])
+
+    def test_frozen_camera_rejected(self):
+        self.mutate(lambda r:r.update(_act_camera_id=np.array([0,0,0])))
+        self.assertFalse(inspect_episode(self.ep)[0]['passed'])
+
+    def test_missing_image_and_aborted_rejected(self):
+        (self.ep/'leftImg'/'0.jpg').unlink()
+        self.assertFalse(inspect_episode(self.ep)[0]['passed'])
+        closed=json.loads((self.ep/'closed.json').read_text())
+        closed['aborted']=True
+        (self.ep/'closed.json').write_text(json.dumps(closed))
+        self.assertFalse(inspect_episode(self.ep)[0]['passed'])
+
+    def test_row_camera_order_rejected(self):
+        self.mutate(lambda r:r.update(_teleop_camera_names=np.array(['left','top','right'])))
+        self.assertFalse(inspect_episode(self.ep)[0]['passed'])
+
+    def test_three_view_preview(self):
+        from dobot_control.act_dataset import main
+        writer=Mock();writer.isOpened.return_value=True
+        with patch('sys.argv',['act','preview',str(self.ep),'--output',str(self.root/'preview.mp4')]), patch('cv2.VideoWriter',return_value=writer) as create:
+            main()
+        self.assertEqual(create.call_args.args[-1],(1920,480))
+        self.assertEqual(writer.write.call_args.args[0].shape,(480,1920,3))
+        writer.release.assert_called_once()
+
+    def test_mixed_task_export_rejected(self):
+        from dobot_control.act_dataset import main
+        other=dict(self.meta,fixture='different_fixture')
+        fixture(self.root/'raw'/'2',names=('top','left','right'),metadata=other)
+        with patch('sys.argv',['act','convert',str(self.root/'raw'),'--output',str(self.root/'export')]):
+            with self.assertRaisesRegex(ValueError,'incompatible'):
+                main()
 
 if __name__=='__main__':unittest.main()
