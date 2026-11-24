@@ -653,6 +653,7 @@ class MasterSerialRecoveryTests(unittest.TestCase):
             dispatch(action)
         dispatch.assert_not_called()
 
+    @patch("experiments.run_control.validate_hardware_config", new=lambda: None)
     def test_real_main_loop_clears_servo_and_recording_before_stale_sample_dispatch(self):
         from experiments import run_control as control
         states = np.ones((2, 3), dtype=int)
@@ -717,7 +718,7 @@ class ConfirmedPhysicalLayoutTests(unittest.TestCase):
     def test_server_and_home_keep_calibrated_ip_order(self):
         from experiments import launch_nodes
         from scripts.manipulate_utils import robot_pose_init
-        from task_skills.layout import physical_nova_ip, physical_nova_gripper_binding
+        from dobot_control.layout import physical_nova_ip, physical_nova_gripper_binding
         self.assertEqual(physical_nova_ip("right"), "192.168.5.1")
         self.assertEqual(physical_nova_ip("left"), "192.168.5.2")
         self.assertEqual(physical_nova_gripper_binding("right"), ("GRIPPER_RIGHT", "COM4"))

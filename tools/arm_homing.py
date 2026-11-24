@@ -5,7 +5,7 @@ import logging
 import re
 import time
 
-from task_skills.layout import physical_nova_home_degrees, physical_nova_ip, TELEOP_NOVA_SIDES
+from dobot_control.layout import physical_nova_home_degrees, physical_nova_ip, TELEOP_NOVA_SIDES
 
 SPEED_RAD_S = 0.15
 PERIOD_S = 0.05

@@ -23,9 +23,11 @@ from dobot_control.cameras.settings import CAMERA_NAMES, load_camera_settings
 from dobot_control.async_writer import BoundedAsyncWriter
 from dobot_control.act_recording import CameraSnapshots, atomic_json, enrich_observation, validate_camera_packet, RecordingCadence
 from dobot_control.act_task import load_act_task
+from dobot_control.layout import physical_nova_ip
+from dobot_control.config import hardware_metadata, validate_hardware_config
 
 act_cameras = CameraSnapshots()
-from dobot_control.absolute_teleop import AbsoluteTeleopPlanner, CommandInterval, DEFAULT_FOLLOW_SPEED_RAD_S
+from dobot_control.absolute_teleop import AbsoluteTeleopPlanner, CommandInterval, DEFAULT_FOLLOW_SPEED_RAD_S, configured_teleop_planner
 from dobot_control.teleop_safety import (
     MasterRunawayGuard,
     check_pose_protection,
@@ -33,6 +35,7 @@ from dobot_control.teleop_safety import (
 )
 import datetime
 from pathlib import Path
+from dobot_control.config import config_path as get_config_path
 import requests
 
 @dataclass
@@ -113,20 +116,18 @@ def write_recording_sample(sample):
     observations["_teleop_camera_names"] = np.asarray(sample.camera_names)
     if "_act_schema" in observations and not (episode_dir / "episode.json").exists():
         import hashlib
-        config = Path(BASE_DIR) / "scripts/dobot_config/dobot_settings.ini"
+        config = get_config_path()
         atomic_json(episode_dir / "episode.json", {
             "schema": 2, "task": "bottle_cap_open", "status": "unreviewed",
             "camera_names": list(sample.camera_names),
-            "channel_order": ["192.168.5.1 J1..J6", "192.168.5.1 gripper", "192.168.5.2 J1..J6", "192.168.5.2 gripper"],
-            "physical_side_note": "operator confirmed 2026-11-06: .1 RIGHT; .2 LEFT",
             "hardware_layout_version": 2,
-            "gripper_ports": {"192.168.5.1": "COM4/ID22", "192.168.5.2": "COM3/ID21"},
             "joint_unit": "rad", "gripper": "driver position / 255; 0=fully closed, 1=fully open (onsite confirmed 2026-11-06)",
             "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
             "top_crop": None, "top_flip": True,
             "image_pipeline_version": 2, "image_size": [480, 640],
             "clock": "host perf_counter seconds; camera host receive time, not exposure time",
             "send_ok_semantics": "env.step RPC returned without exception; not controller arrival acknowledgement",
+            **hardware_metadata(),
             **(sample.metadata or {}),
         })
     save_frame(str(obs_dir) + os.sep, sample.index, observations, sample.action)
@@ -550,8 +551,8 @@ def get_robot_type(robot_ip):
         return None
 
 def check_firmware_version():
-    left_version = get_firmware_version_satisfied("192.168.5.2")
-    right_version = get_firmware_version_satisfied("192.168.5.1")
+    left_version = get_firmware_version_satisfied(physical_nova_ip("left"))
+    right_version = get_firmware_version_satisfied(physical_nova_ip("right"))
     if left_version[1] < 3581 or left_version[1]>=4000:
         print("[ERROR]LEFT Nova error[192.168.5.2]:firmware version requires V3 and must >=3.5.8.1 (found: %s),please check and update"%left_version[1])
         return False
@@ -561,6 +562,7 @@ def check_firmware_version():
     return True
 
 def main(args):
+    validate_hardware_config()
     # create dataset file path
     save_dir = str(Path(args.save_data_path) / args.project_name / "collect_data")
     mk_dir(save_dir)
@@ -579,7 +581,7 @@ def main(args):
     recording_metadata = None
     if os.environ.get("DOBOT_ACT_RECORDING") == "1":
         import hashlib
-        config_path = Path(BASE_DIR) / "scripts/dobot_config/dobot_settings.ini"
+        config_path = get_config_path()
         recording_metadata = dict(load_act_task(config_path),
             camera_names=list(camera_settings.serials),
             camera_serials=dict(camera_settings.serials),
@@ -627,7 +629,7 @@ def main(args):
     print("If the robot fails to initialize successfully after 5 seconds,please check that the robot network is connected correctly and make sure TCP/IP mode is turned!")
     if check_firmware_version()==False:
         return
-    robot_type = get_robot_type("192.168.5.1")
+    robot_type = get_robot_type(physical_nova_ip("right"))
     env = RobotEnv(robot_client)
     env.set_do_status([1, 0])
     env.set_do_status([2, 0])
@@ -668,16 +670,10 @@ def main(args):
     # Bound follower speed in physical units instead of using one fixed step
     # per loop. The loop is variable-rate because it includes network and
     # status RPCs; a fixed step therefore creates lag at low frequency.
-    max_servoj_speed_rad_s = float(
-        os.environ.get("DOBOT_SERVOJ_MAX_SPEED_RAD_S", str(DEFAULT_FOLLOW_SPEED_RAD_S))
-    )
-    max_servoj_step_rad = float(
-        os.environ.get("DOBOT_SERVOJ_MAX_STEP_RAD", "0.35")
-    )
-    align_speed = float(os.environ.get("DOBOT_ALIGN_SPEED_RAD_S", "0.15"))
-    planner = AbsoluteTeleopPlanner(align_speed=align_speed,
-                                   follow_speed=max_servoj_speed_rad_s,
-                                   max_step=max_servoj_step_rad)
+    planner = configured_teleop_planner()
+    max_servoj_speed_rad_s = planner.follow_speed
+    max_servoj_step_rad = planner.max_step
+    align_speed = planner.align_speed
     command_interval = CommandInterval()
     last_tcp_limit_log = 0.0
     print(

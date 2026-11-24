@@ -9,6 +9,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
+from dobot_control.config import config_path as get_config_path
 
 import numpy as np
 from third_party.DynamixelSDK.python.src.dynamixel_sdk.port_handler import PortHandler
@@ -16,7 +17,7 @@ from third_party.DynamixelSDK.python.src.dynamixel_sdk.packet_handler import Pac
 from scripts.manipulate_utils import load_ini_data_hands
 
 REPO = Path(__file__).resolve().parents[1]
-INI_PATH = REPO / "scripts/dobot_config/dobot_settings.ini"
+INI_PATH = get_config_path()
 
 
 class ReadOnlyPositionPort(PortHandler):
@@ -71,7 +72,7 @@ def capture(section, config, reference_positioned=False):
     mapped = (raw - offsets) * signs
     result = {
         "section": section, "port": config.port, "joint_ids": ids,
-        "nova_side": "right" if section == "HAND_LEFT" else "left",
+        "nova_side": "left" if section == "HAND_LEFT" else "right",
         "raw_rad": raw.tolist(), "mapped_deg": np.rad2deg(mapped).tolist(),
         "reference_deg": np.rad2deg(reference).tolist(),
         "offsets_rad": offsets.tolist(), "signs": signs.tolist(),

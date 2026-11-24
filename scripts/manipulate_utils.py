@@ -4,10 +4,11 @@ import configparser
 from dobot_control.agents.dobot_agent import DobotRobotConfig
 import os
 from pathlib import Path
+from dobot_control.config import config_path as get_config_path
 from dataclasses import dataclass
 
 from scripts.function_util import wait_period, log_write
-from task_skills.layout import TELEOP_NOVA_SIDES, physical_nova_home_degrees
+from dobot_control.layout import TELEOP_NOVA_SIDES, physical_nova_home_degrees
 
 
 def set_light(env, which_color, which_status):
@@ -28,7 +29,7 @@ def set_light(env, which_color, which_status):
 
 def load_ini_data_camera():
     camera_dict = {"top": None, "left": None, "right": None}
-    ini_file_path = str(Path(__file__).parent) + "/dobot_config/dobot_settings.ini"
+    ini_file_path = str(get_config_path())
     ini_file = configparser.ConfigParser()
     ini_file.read(ini_file_path)
     for _cam in camera_dict.keys():
@@ -36,7 +37,7 @@ def load_ini_data_camera():
     return camera_dict
 
 def load_ini_data_hands():
-    ini_file_path = str(Path(__file__).parent) + "/dobot_config/dobot_settings.ini"
+    ini_file_path = str(get_config_path())
     ini_file = configparser.ConfigParser()
     ini_file.read(ini_file_path)
 
@@ -63,7 +64,7 @@ class GripperConfig:
 
 
 def load_ini_data_gripper():
-    ini_file_path = str(Path(__file__).parent) + "/dobot_config/dobot_settings.ini"
+    ini_file_path = str(get_config_path())
     ini_file = configparser.ConfigParser()
     ini_file.read(ini_file_path)
 

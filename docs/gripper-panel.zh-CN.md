@@ -1,5 +1,7 @@
 # 夹爪控制与从臂慢速归位窗口
 
+新增本地网页入口，双击 `open_local_console.cmd`。网页包含本窗口的夹爪开合、左右从臂慢速归位和停止归位，并提供 ACT 常用指令复制与执行。使用方法见 [本地控制台说明](local-console.zh-CN.md)。
+
 双击仓库根目录 `open_gripper_panel.cmd`，或在 PowerShell 运行：
 
 ```powershell

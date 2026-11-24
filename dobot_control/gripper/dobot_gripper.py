@@ -20,6 +20,10 @@ sys.path.append(BASE_DIR)
 from third_party.feetech.scservo_sdk import *
 
 
+class GripperReadTimeout(ValueError):
+    """No position reply was received within the serial packet timeout."""
+
+
 def deal_hex_send_data(send_data):
     r_send_data = struct.pack("%dB" % (len(send_data)), *send_data)
     return r_send_data
@@ -72,7 +76,7 @@ class DobotGripper:
     def set_latency_timer(self):
         if os.name == "nt":
             return
-        _port_name = self.port.split("/")[-1]
+        _port_name = os.path.basename(os.path.realpath(self.port))
         free_limit_and_set_one(f"/sys/bus/usb-serial/devices/{_port_name}/latency_timer")
 
     def ping(self) -> None:
@@ -141,7 +145,8 @@ class DobotGripper:
             if error != 0:
                 failure_types.append("servo/device error")
             failures = " and ".join(failure_types)
-            raise ValueError(
+            failure_class = GripperReadTimeout if result == COMM_RX_TIMEOUT and error == 0 else ValueError
+            raise failure_class(
                 f"ReadPos failed for servo ID {self._servo_id}: {failures} "
                 f"(comm_result={result}, servo_error={error})"
             )

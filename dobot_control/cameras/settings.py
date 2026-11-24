@@ -2,9 +2,10 @@
 import configparser
 from dataclasses import dataclass, field
 from pathlib import Path
+from dobot_control.config import config_path as get_config_path
 
 CAMERA_NAMES = ("top", "left", "right")
-DEFAULT_PATH = Path(__file__).resolve().parents[2] / "scripts/dobot_config/dobot_settings.ini"
+DEFAULT_PATH = get_config_path()
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 from tools.arm_homing import ArmHoming, StopUnconfirmed, values, validate_path
 from tools.gripper_panel import GripperControl
-from task_skills.layout import physical_nova_home_degrees, physical_nova_ip
+from dobot_control.layout import physical_nova_home_degrees, physical_nova_ip
 
 
 class ArmHomingTests(unittest.TestCase):

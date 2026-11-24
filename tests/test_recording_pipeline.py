@@ -17,6 +17,7 @@ from tests.test_act_dataset import fixture
 
 
 class RecordingPipelineTests(unittest.TestCase):
+    @patch("experiments.run_control.validate_hardware_config", new=lambda: None)
     def test_act_default_queue_has_capacity_for_filesystem_stalls(self):
         from experiments import run_control as control
         from dobot_control.cameras.settings import CameraSettings

@@ -1,3 +1,5 @@
+> 2026-11-24：共用布局与设备锁迁至 dobot_control；Linux 操作请见 [Linux 手册](manuals/TELEOP_LINUX_SETUP.zh-CN.md)。本节按钮路由按当前 master_to_nova_action 更新。
+
 # Windows 本机双臂遥操部署与操作手册
 
 更新：2026-11-06（北京时间）。本手册对应当前工作树，纳入 ACT 采集、相机全画幅、夹爪窗口、异常恢复及 NOVA2 实机绑定修正。
@@ -503,7 +505,7 @@ E:\Dobot\.venv\Scripts\python.exe -X utf8 -B experiments\run_control.py --hostna
 
 握稳并支撑主手，先开启一侧；`ALIGN_START` 后保持稳定，待 `ALIGN_DONE` 再小幅移动。对齐默认 0.15 rad/s，指令和实测六轴误差均在 0.02 rad 内连续 3 次后切换正常跟随。正常默认上限为 3.2 rad/s（原 4.0 的 80%），每次规划的时间跨度最多按 0.05 s 计算，单步上限 0.35 rad，仍受其他保护约束。
 
-再长按该 A 关闭该侧跟随，查看 `SERVO_OFF` 并确认实体静止、主手锁定；两侧分别确认后再依次双侧开启。COM5/hand=1 控制左 Nova 六轴，COM6/hand=0 控制右 Nova 六轴；夹爪路由见第 6 节。
+再长按该 A 关闭该侧跟随，查看 `SERVO_OFF` 并确认实体静止、主手锁定；两侧分别确认后再依次双侧开启。HAND_RIGHT（原 COM5/hand=1）控制右 Nova 六轴，HAND_LEFT（原 COM6/hand=0）控制左 Nova 六轴；夹爪路由见第 6 节。
 
 当前边界检查两侧活动臂的模型夹爪点：X、Y 包含端点，Z 严格大于 40 mm。向下 TCP 指令速度保护阈值仍为 1 m/s，与 3.2 rad/s 的关节限速不是同一个量。`TCP_SPEED_LIMITED` 会缩小本周期步长；`ALIGN_REJECTED_UNSAFE`、`SERVO_REJECTED`、`MASTER_DROP_LOCK` 应按原因停查，不反复长按或扩大范围。
 

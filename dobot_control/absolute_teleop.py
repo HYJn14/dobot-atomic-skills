@@ -1,7 +1,16 @@
 """Non-actuating absolute joint target planner, with per-arm slow alignment."""
 import numpy as np
+import os
 
 DEFAULT_FOLLOW_SPEED_RAD_S = 3.2
+
+
+def configured_teleop_planner():
+    """Use the same operator-selected motion settings for teleop and ACT."""
+    return AbsoluteTeleopPlanner(
+        align_speed=float(os.environ.get('DOBOT_ALIGN_SPEED_RAD_S', '0.15')),
+        follow_speed=float(os.environ.get('DOBOT_SERVOJ_MAX_SPEED_RAD_S', str(DEFAULT_FOLLOW_SPEED_RAD_S))),
+        max_step=float(os.environ.get('DOBOT_SERVOJ_MAX_STEP_RAD', '0.35')))
 
 class AbsoluteTeleopPlanner:
     def __init__(self, align_speed=0.15, follow_speed=DEFAULT_FOLLOW_SPEED_RAD_S, max_step=0.35,

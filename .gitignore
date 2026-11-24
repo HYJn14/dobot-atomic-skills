@@ -24,3 +24,7 @@ task_skills/artifacts/
 *.swo
 .font-cache/
 scripts/logs/teleop_runtime.log
+
+config/*.local.ini
+.venv-teleop/
+reports/linux-simulation/

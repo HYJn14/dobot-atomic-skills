@@ -20,16 +20,19 @@ class GripperFeedback:
     def run(self):
         while not self.stop.is_set():
             try:
-                # Never start a read while a command owns the serial bus.
-                if self.gripper.command_lock.acquire(blocking=False):
-                    try:
-                        raw = self.gripper.get_current_position()
-                    finally:
-                        self.gripper.command_lock.release()
-                    if not 0 <= raw <= 255:
-                        raise ValueError(f'gripper position out of range: {raw}')
-                    with self.lock:
-                        self.value, self.timestamp, self.error = raw / 255., time.perf_counter(), ''
+                # Wait briefly behind a write instead of skipping an entire
+                # 100ms sampling period each time the serial bus is occupied.
+                if not self.gripper.command_lock.acquire(timeout=.03):
+                    self.stop.wait(.01)
+                    continue
+                try:
+                    raw = self.gripper.get_current_position()
+                finally:
+                    self.gripper.command_lock.release()
+                if not 0 <= raw <= 255:
+                    raise ValueError(f'gripper position out of range: {raw}')
+                with self.lock:
+                    self.value, self.timestamp, self.error = raw / 255., time.perf_counter(), ''
             except Exception as exc:
                 with self.lock:
                     self.error = str(exc)

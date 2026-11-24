@@ -16,7 +16,8 @@ from tkinter import ttk, messagebox
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-INI_PATH = ROOT / "scripts/dobot_config/dobot_settings.ini"
+from dobot_control.config import config_path as get_config_path
+INI_PATH = get_config_path()
 SPEED = 10
 TARGETS = {"open": 255, "close": 0}  # Confirmed by the operator.
 SECTIONS = {"left": "GRIPPER_LEFT", "right": "GRIPPER_RIGHT"}
@@ -55,7 +56,7 @@ def make_gripper(endpoint):
 
 
 def make_lease():
-    from task_skills.device_lease import DeviceLease
+    from dobot_control.device_lease import DeviceLease
     path = os.environ.get("DOBOT_DEVICE_LOCK_PATH") or str(
         ROOT.parent / ".local/runtime/device-owner")
     return DeviceLease(path=path, purpose="legacy-control")

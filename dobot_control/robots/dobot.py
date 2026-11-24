@@ -41,7 +41,8 @@ class DobotRobot(Robot):
         self.r_inter.SetTool(1, 0, 0, 197, 0, 0, 0)  # 设置夹爪工具坐标系
         self.r_inter.Tool(1)  # 设置当前工具坐标系，使得Getpose()获取坐标时为此工具下
 
-        self.com_list = {"192.168.5.1": "GRIPPER_RIGHT", "192.168.5.2": "GRIPPER_LEFT"}
+        from dobot_control.config import robot_ip as configured_ip
+        self.com_list = {configured_ip("right"): "GRIPPER_RIGHT", configured_ip("left"): "GRIPPER_LEFT"}
         _, gripper_dict = load_ini_data_gripper()
         self.gripper_list = gripper_dict[self.com_list[robot_ip]].pos
         self.gripper_id_name = gripper_dict[self.com_list[robot_ip]].id_name
@@ -81,6 +82,7 @@ class DobotRobot(Robot):
             print(f"[ACT] measured gripper feedback enabled: {robot_ip}", flush=True)
 
     def _initialize_gripper(self):
+        from dobot_control.gripper.dobot_gripper import GripperReadTimeout
         # launch_nodes constructs physical RIGHT (.1) then LEFT (.2). Wait so
         # the next gripper cannot start while this one's cycle is unfinished.
         for target in (0, 255):
@@ -88,7 +90,15 @@ class DobotRobot(Robot):
             self.gripper.move(target, 10, 1)
             deadline = time.monotonic() + 10.0
             while True:
-                position = self.gripper.get_current_position()
+                for attempt in range(3):
+                    try:
+                        position = self.gripper.get_current_position()
+                        break
+                    except GripperReadTimeout:
+                        if attempt == 2 or time.monotonic() >= deadline:
+                            raise
+                        print(f"[GRIPPER READ RETRY] ip={self.robot_ip} attempt={attempt+1}/2", flush=True)
+                        time.sleep(0.05)
                 if abs(position - target) <= 5:
                     break
                 if time.monotonic() >= deadline:

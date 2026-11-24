@@ -12,6 +12,7 @@ from experiments import run_control as control
 
 
 class CameraTests(unittest.TestCase):
+    @patch("experiments.run_control.validate_hardware_config", new=lambda: None)
     def test_preview_initialization_precedes_master_construction(self):
         order = []
         settings = CameraSettings({'top':'123'},15)

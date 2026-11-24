@@ -8,7 +8,7 @@ import tyro
 from dobot_control.robots.dobot import DobotRobot
 from dobot_control.robots.robot import BimanualRobot, PrintRobot
 from dobot_control.robots.robot_node import ZMQServerRobot
-from task_skills.layout import TELEOP_NOVA_SIDES, physical_nova_ip
+from dobot_control.layout import TELEOP_NOVA_SIDES, physical_nova_ip
 
 
 @dataclass
@@ -18,7 +18,9 @@ class Args:
 
 
 def launch_robot_server(args: Args):
-    from task_skills.device_lease import DeviceLease
+    from dobot_control.config import validate_hardware_config
+    validate_hardware_config()
+    from dobot_control.device_lease import DeviceLease
 
     # The legacy ZMQ server has no verified shutdown protocol. Keep ownership
     # on exit until an onsite operator verifies the rig and clears the lock.

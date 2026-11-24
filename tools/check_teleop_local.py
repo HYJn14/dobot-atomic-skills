@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from dobot_control.config import config_path as get_config_path
 
 
 def main():
@@ -43,7 +44,7 @@ def main():
             failures.append(f"{module}: {type(exc).__name__}: {exc}")
 
     config = configparser.ConfigParser()
-    config.read(ROOT / "scripts/dobot_config/dobot_settings.ini", encoding="utf-8")
+    config.read(get_config_path(), encoding="utf-8")
     ports = []
     cameras = []
     try:

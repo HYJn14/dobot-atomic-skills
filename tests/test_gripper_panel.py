@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from tools.gripper_panel import Endpoint, GripperControl, GripperPanel, load_endpoints
-from task_skills.device_lease import DeviceLease
+from dobot_control.device_lease import DeviceLease
 
 
 class ControlTests(unittest.TestCase):
