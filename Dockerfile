@@ -11,4 +11,4 @@ RUN python -m pip install --no-cache-dir -r requirements-teleop-linux.txt pytest
 COPY . .
 RUN mkdir -p /workspace/datasets /workspace/.local/runtime .local
 # Default is hardware-free regression/data flow. Real operation is explicit.
-CMD ["xvfb-run", "-a", "python", "tools/test_release.py"]
+CMD ["python", "tools/container_test.py"]

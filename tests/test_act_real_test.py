@@ -1,4 +1,5 @@
 import time
+import sys
 from unittest.mock import patch
 
 import numpy as np
@@ -182,6 +183,7 @@ def test_deadline_starts_at_send_and_respects_input_expiry():
             command_deadline(observation, origin, 1.2)
 
 
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows live CLI requires foreground-key gate; Linux RPC/data flow is exercised separately')
 @pytest.mark.parametrize('model_latency', [.005, .12])
 @pytest.mark.parametrize('allow_gripper', [False, True])
 def test_full_execute_rpc_pause_resume_and_restart(tmp_path, monkeypatch, nova_fk, model_latency, allow_gripper):
