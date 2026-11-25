@@ -2,13 +2,15 @@
 
 此镜像封装 Python3.10、遥操/夹爪/RealSense/GUI/采集转换依赖和测试工具。基础系统 Ubuntu22.04，可在原 Ubuntu20.04 Linux Docker 主机上运行；训练继续使用原 dobot-act CUDA 环境。模型权重、数据、硬件本机配置独立挂载。
 
+本次已构建镜像与测试结果见 [发布报告](../docs/migration/20261125-linux-docker-release.zh-CN.md)。
+
 ## 获取镜像
 
 在 GitHub 的 Linux Docker release 成功运行页面，下载 artifact `dobot-teleop-linux-amd64`，解压外层 ZIP，得到 `dobot-teleop-linux-amd64.tar.gz`。镜像适用于 amd64/x86_64；Actions artifact 保留30天，也可从源码重新构建。
 
 ```bash
 docker load -i dobot-teleop-linux-amd64.tar.gz
-docker run --rm --network none dobot-teleop:linux
+docker run --rm dobot-teleop:linux
 ```
 
 默认命令执行全部离线测试和完整合成数据流程，使用 Xvfb 虚拟显示，无设备挂载。它包含网页 HTTP 接口、A/B 真实本机 RPC、合成图像/状态的异步录制、质检、回看、标注、HDF5 导出、训练集归一化与 ACT 输入加载。测试不运行 GPU 优化训练。
@@ -91,6 +93,6 @@ docker compose --profile hardware down
 
 ## CI与证据
 
-`.github/workflows/linux-docker.yml` 在 linux 分支推送后：构建镜像 → 无外网容器离线测试 → docker save → 上传镜像和日志。镜像仅在测试成功后导出。
+`.github/workflows/linux-docker.yml` 在 linux 分支推送后：构建镜像 → 容器内离线设备模拟测试 → docker save → 上传镜像和日志。镜像仅在测试成功后导出。
 
 参考：[Docker Compose 配置](https://docs.docker.com/reference/compose-file/services/)、[GitHub Actions artifacts](https://docs.github.com/en/actions/tutorials/store-and-share-data)。

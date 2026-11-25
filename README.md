@@ -28,6 +28,8 @@ python -m experiments.run_control --show-img --project-name tube_insert_linux_v1
 
 保留主手按钮、绝对关节跟随、对齐与运动保护、夹爪、单/多相机预览、异步录制、ACT 质量检查/标注/HDF5 导出、训练/评估，以及 Windows ACT 实验工具。删除独立任务 DAG、中文任务解析、化学/烧杯任务和上游 HTTP 执行网关；详见迁移清单。
 
+2026-11-25：[完整流程与 Docker 发布](docs/migration/20261125-linux-docker-release.zh-CN.md)已通过，Linux 容器160项通过、7项Windows专属跳过，并完成合成数据全流程。
+
 ## 离线验证
 
 ```bash
